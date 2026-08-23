@@ -1,5 +1,7 @@
 # GitLab Pipeline Viewer
 
+> [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 一个 IntelliJ IDEA 插件，让你在 IDE 侧边栏直接查看、触发和管理多个 GitLab 项目的 CI/CD 流水线，
 无需切换浏览器即可完成「查看流水线状态 → 查看构建日志 → 触发 / 重试 / 取消」的完整闭环。
 
