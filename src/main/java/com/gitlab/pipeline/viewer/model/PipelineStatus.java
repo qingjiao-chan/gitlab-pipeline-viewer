@@ -22,7 +22,9 @@ public enum PipelineStatus {
     PREPARING("preparing", "准备中", 0x0969DA, true, false, false),
     WAITING("waiting_for_resource", "等待资源", 0x0969DA, true, false, false),
     MANUAL("manual", "手动", 0x6E7781, false, false, true),
-    SKIPPED("skipped", "已跳过", 0x6E7781, false, false, false);
+    // skipped 也视为可执行/可重试：GitLab 中 when: manual 的手动作业默认以 skipped 状态展示，
+    // 同样可通过 play（执行）触发，不能与"因条件被跳过"的无操作 Job 混淆而禁用按钮。
+    SKIPPED("skipped", "已跳过", 0x6E7781, false, false, true);
 
     /**
      * 未知状态下使用的兜底文案
@@ -77,7 +79,7 @@ public enum PipelineStatus {
     }
 
     /**
-     * Job 是否可执行或重试（手动 / 失败 / 已取消）
+     * Job 是否可执行或重试（手动 / 已跳过的手动作业 / 失败 / 已取消）
      */
     public boolean isRetryableJob() {
         return retryableJob;

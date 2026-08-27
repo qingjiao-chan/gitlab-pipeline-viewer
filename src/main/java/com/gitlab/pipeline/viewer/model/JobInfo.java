@@ -47,6 +47,6 @@ public class JobInfo {
 
     @Override
     public String toString() {
-        return name + " [" + status + "]";
+        return name + " (" + status + ")";
     }
 }

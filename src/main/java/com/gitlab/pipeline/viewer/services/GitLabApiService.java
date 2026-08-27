@@ -12,6 +12,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -215,6 +216,115 @@ public class GitLabApiService {
             return resp.body();
         }
         throw new GitLabApiException(resp.statusCode(), resp.body());
+    }
+
+    /**
+     * 增量拉取 Job 构建日志（Range 请求头），避免每次自动刷新都下载整份日志：
+     * <ul>
+     *   <li>fromByte=0：全量拉取（200），full=true；</li>
+     *   <li>fromByte&gt;0：请求 Range: bytes=&lt;fromByte&gt;- ；GitLab 运行中返回 206 部分内容
+     *       （full=false），已结束返回 200 完整内容（full=true；服务器忽略 Range 时同样返回 200
+     *       完整内容，可安全回退整份替换），或 416（偏移已到末尾，无新内容）。</li>
+     * </ul>
+     * 多字节 UTF-8 字符可能被 Range 边界切断：上一块末尾未完成的字节由调用方经 [carry] 传入，
+     * 与本次返回合并解码后再把新的未完成尾部随结果带回，保证拼接后日志不出现乱码。
+     */
+    public JobTraceResult getJobTrace(long projectId, long jobId, long fromByte, byte[] carry) throws Exception {
+        String url = api(GitLabEndpoints.JOB_TRACE, projectId, jobId);
+        HttpRequest.Builder builder = get(url);
+        if (fromByte > 0) {
+            builder.header(GitLabEndpoints.HEADER_RANGE, "bytes=" + fromByte + "-");
+        }
+        HttpResponse<byte[]> resp = client.send(builder.GET().build(), HttpResponse.BodyHandlers.ofByteArray());
+        int code = resp.statusCode();
+        if (code == 416) {
+            // 请求偏移已到日志末尾：没有新内容可追加
+            return new JobTraceResult("", fromByte, new byte[0], false);
+        }
+        if (code != 200 && code != 206) {
+            throw new GitLabApiException(code, new String(resp.body(), StandardCharsets.UTF_8));
+        }
+        boolean partial = code == 206;
+        byte[] body = resp.body() == null ? new byte[0] : resp.body();
+        // 206=增量：拼上上次未完成的多字节尾部再解码；200=完整内容，从头部解码，丢弃上次 carry
+        byte[] merged = partial ? concat(carry, body) : body;
+        Utf8Split split = splitUtf8(merged);
+        long nextOffset;
+        if (partial) {
+            String cr = resp.headers().firstValue(GitLabEndpoints.HEADER_CONTENT_RANGE).orElse(null);
+            long end = cr == null ? -1 : contentRangeEnd(cr);
+            nextOffset = end >= 0 ? end + 1 : fromByte + body.length;
+        } else {
+            nextOffset = split.text.getBytes(StandardCharsets.UTF_8).length;
+        }
+        return new JobTraceResult(split.text, nextOffset, split.carry, !partial);
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] r = new byte[a.length + b.length];
+        System.arraycopy(a, 0, r, 0, a.length);
+        System.arraycopy(b, 0, r, a.length, b.length);
+        return r;
+    }
+
+    /**
+     * 从 Content-Range 头解析末字节偏移（"bytes 0-1023/146515" -> 1023）；解析失败返回 -1
+     */
+    private static long contentRangeEnd(String header) {
+        int slash = header.indexOf('/');
+        String range = slash >= 0 ? header.substring(0, slash) : header;
+        int dash = range.lastIndexOf('-');
+        if (dash < 0) return -1;
+        try {
+            return Long.parseLong(range.substring(dash + 1).trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static final class Utf8Split {
+        final String text;
+        final byte[] carry;
+
+        Utf8Split(String text, byte[] carry) {
+            this.text = text;
+            this.carry = carry;
+        }
+    }
+
+    /**
+     * 按 UTF-8 解码字节块；若末尾存在未完成的多字节序列，截断保留到 carry 供下一块拼接，
+     * 避免 Range 分块切断多字节字符导致乱码/搜索错位。
+     */
+    private static Utf8Split splitUtf8(byte[] bytes) {
+        int n = bytes.length;
+        int cut = n;
+        for (int i = n - 1; i >= Math.max(0, n - 4); i--) {
+            int b = bytes[i] & 0xFF;
+            if (b < 0x80) {
+                break; // 结尾是 ASCII，之前内容完整
+            }
+            if (b >= 0xC0) { // 多字节序列首字节
+                int expected = b < 0xE0 ? 2 : (b < 0xF0 ? 3 : 4);
+                if (n - i < expected) {
+                    cut = i; // 末尾序列不完整：截断并保留为 carry
+                }
+                break;
+            }
+            // 0x80-0xBF：续字节，继续向前找首字节
+        }
+        String text = new String(bytes, 0, cut, StandardCharsets.UTF_8);
+        byte[] carry = cut < n ? Arrays.copyOfRange(bytes, cut, n) : new byte[0];
+        return new Utf8Split(text, carry);
+    }
+
+    /**
+     * 获取单个 Job 的实时状态（自动刷新日志时同步更新状态显示）。
+     * 用短 TTL 缓存：自动刷新间隔 ≥5s，5s 缓存与刷新频率一致，兼顾实时性与接口压力。
+     */
+    public JobInfo getJob(long projectId, long jobId) throws Exception {
+        String url = api(GitLabEndpoints.JOB, projectId, jobId);
+        return JobInfo.from(cachedGet(url, TTL_LIST_CACHE).getAsJsonObject());
     }
 
     /**

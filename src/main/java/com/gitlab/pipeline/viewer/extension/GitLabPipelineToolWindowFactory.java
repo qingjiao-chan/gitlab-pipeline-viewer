@@ -22,6 +22,6 @@ public class GitLabPipelineToolWindowFactory implements ToolWindowFactory {
         GitLabPipelinePanel panel = new GitLabPipelinePanel(project, toolWindow);
         Content content = ContentFactory.getInstance().createContent(panel, "", false);
         toolWindow.getContentManager().addContent(content);
-        Disposer.register(toolWindow.getDisposable(), (Disposable) panel);
+        Disposer.register(toolWindow.getDisposable(), panel);
     }
 }

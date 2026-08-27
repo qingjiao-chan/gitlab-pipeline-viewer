@@ -100,10 +100,25 @@ public final class PipelineDataService {
     }
 
     /**
-     * 打开 / 刷新单个 Job 的日志
+     * 增量拉取 Job 日志：fromByte=0 全量；&gt;0 走 Range 请求头只取新增部分。
+     * 返回结果标明 content 是完整日志（替换）还是增量（追加）。
      */
-    public String loadTrace(long projectId, long jobId) throws Exception {
-        return api().getJobTrace(projectId, jobId);
+    public JobTraceResult loadTraceChunk(long projectId, long jobId, long fromByte, byte[] carry) throws Exception {
+        return api().getJobTrace(projectId, jobId, fromByte, carry);
+    }
+
+    /**
+     * 获取单个 Job 的实时状态（自动刷新日志时同步更新状态显示）
+     */
+    public JobInfo loadJob(long projectId, long jobId) throws Exception {
+        return api().getJob(projectId, jobId);
+    }
+
+    /**
+     * 获取单条流水线详情（Job 结束后用于同步列表行的最新状态）
+     */
+    public PipelineInfo loadPipelineDetail(long projectId, long pipelineId) throws Exception {
+        return api().getPipelineDetail(projectId, pipelineId);
     }
 
     /**

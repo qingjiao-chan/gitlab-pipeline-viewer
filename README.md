@@ -8,7 +8,8 @@
 ## 项目介绍
 
 插件基于 **GitLab REST API v4** 实现，使用 `PRIVATE-TOKEN`（个人访问令牌）认证，
-通过 Gradle（`org.jetbrains.intellij` 1.17.4）构建，目标平台为 IntelliJ IDEA 2023.2，
+UI 采用 **Kotlin + IntelliJ DSL**（`com.intellij.ui.dsl.builder`）编写，通过 Gradle
+（`org.jetbrains.intellij` 1.17.4）构建，目标平台为 IntelliJ IDEA 2023.2，
 兼容 2023.1+ 的所有后续版本。
 
 **核心功能：**
@@ -17,12 +18,16 @@
   选择器第一项固定为「当前项目」，其后为 GitLab 项目组树（按需懒加载，不一次性拉全量项目）。
 - **流水线列表**：展示状态、Ref、SHA、来源、创建时间、**耗时**与**触发人**（后两项通过并行拉取
   流水线详情补齐），支持分页浏览更早的历史流水线。
-- **触发流水线**：弹窗选择分支（或手动输入），支持填写自定义 CI/CD 变量（`key=value`）。
+- **新建流水线**：弹窗选择分支（或手动输入），支持填写自定义 CI/CD 变量（`key=value`）。
 - **取消 / 重试**：流水线级与 Job 级均支持；取消仅对运行中 / 等待中的生效，重试仅对失败 / 已取消的生效。
 - **执行手动 Job**：可执行 `.gitlab-ci.yml` 中 `when: manual` 的作业，或重试失败 / 已取消的作业。
-- **日志查看**：查看单个 Job 的完整构建日志，支持关键字搜索、高亮与上一处 / 下一处跳转。
-- **自动刷新**：仅当选中**运行中的流水线**时，自动刷新所选 Job 的日志（列表不自动刷新），
-  默认间隔 5s，可关闭或调整。
+- **日志查看**：基于 IDEA Run 工具窗口同款 `ConsoleView` 展示构建日志——动态追加、ANSI 着色、
+  进度行（`\r` 行首覆盖）语义保留；支持关键字搜索、高亮与上一处 / 下一处跳转。
+- **增量日志（Range 轮询）**：日志经 HTTP `Range` 请求头增量拉取，每次只取上次偏移之后的新增部分
+  追加到控制台（`206` 增量 / `200` 全量替换 / `416` 无新内容），不重复下载整份日志；
+  分块边界若切断多字节 UTF-8 字符，自动拼接 carry 保证不乱码。
+- **自动刷新**：仅当选中**运行中的流水线**且所选 Job 运行中时，周期轮询增量日志
+  （流水线 / Job 列表不自动刷新），默认间隔 5s，可关闭或调整。
 - **布局自适应**：工具窗口停靠侧边时上下分栏，停靠底部 / 顶部时自动切换为左右分栏。
 
 **技术要点：**
@@ -31,7 +36,13 @@
   底层 `GitLabApiService` 对外只暴露领域实体，调用方无裸 JSON。
 - 端点、查询参数、JSON 字段名全部收敛到 `GitLabEndpoints` / `GitLabFieldNames` 常量类，消灭魔法字符串。
 - GET 只读接口带 TTL 缓存（项目 / 分支长缓存、流水线 / Job 列表短缓存），写操作后自动清空缓存。
-- 所有按钮带 loading / 节流，防止连点重复请求。
+- UI 用 Kotlin + `com.intellij.ui.dsl.builder` 编写，控件统一使用主题感知的 JB* 组件。
+- 日志渲染走 IDEA 内置 `ConsoleView`（Run 工具窗口同款），大日志滚动不卡；搜索用
+  Boyer-Moore-Horspool 算法 + 编辑器 MarkupModel 高亮，长日志搜索不卡 EDT。
+- 并发防护：全局 generation 乐观锁丢弃过期响应；日志刷新以 `refreshInFlight` 防叠加、
+  `traceOffset` 校验防止「增量与整体重建交错」导致的重复追加；用户取消后台任务不误报错误。
+- 所有按钮带 loading（`AnimatedIcon` 旋转图标）与节流，日志区加载期间显示「正在加载…」占位层，
+  避免连点与"点了没反应"的生硬感。
 
 ## 环境要求
 
@@ -43,33 +54,49 @@
 
 ```
 gitlab-pipeline-viewer/
-├── build.gradle.kts            # 构建脚本（IntelliJ Gradle 插件 1.17.4，平台 2023.2）
+├── build.gradle.kts            # 构建脚本（IntelliJ Gradle 插件 1.17.4，平台 2023.2；Kotlin 1.9.25）
 ├── settings.gradle.kts         # 构建环境 Profile 机制（代理注入 / JDK 版本校验）
 ├── gradle.properties           # 激活的 profile（默认 local）
-├── config/                     # 各环境 profile 配置（JDK 路径 / 代理 / 本地 IDE 路径）
+├── gradlew / gradlew.bat       # Gradle Wrapper（锁定 Gradle 8.5）
+├── gradle/wrapper/             # Wrapper 元数据与 gradle-wrapper.jar
+├── config/                     # 各环境 profile 配置（gradle-local / gradle-sandbox：JDK / 代理 / 本地 IDE 路径）
 ├── scripts/gradle.sh           # Linux / CI 沙箱专用的命令行构建入口（Windows 本地在 IDEA 内构建，不需要）
+├── .gitignore                  # Git 忽略规则
+├── LICENSE / NOTICE / THIRD_PARTY_NOTICES.md   # 开源协议与第三方依赖声明
 └── src/main/
     ├── java/com/gitlab/pipeline/viewer/
     │   ├── extension/          # 工具窗口扩展点（GitLabPipelineToolWindowFactory）
-    │   ├── model/              # 领域实体：PipelineInfo / JobInfo / GitLabProject / GroupEntry /
-    │   │                       #   BranchInfo / PipelineStatus / PipelineSnapshot / JobsView 等
+    │   ├── model/              # 领域实体
+    │   │   ├── PipelineInfo / JobInfo / PipelineStatus    # 流水线 / Job / 状态枚举
+    │   │   ├── GitLabProject / ProjectEntry / GroupEntry / GroupChildrenView   # 项目组树相关
+    │   │   ├── BranchInfo      # 分支
+    │   │   └── PipelineSnapshot / JobsView                # 数据流中间视图
     │   ├── services/           # 业务服务层
-    │   │   ├── GitLabApiService          # GitLab REST v4 客户端（仓储层，TTL 缓存）
+    │   │   ├── GitLabApiService          # GitLab REST v4 客户端（仓储层，TTL 缓存；Range 增量日志）
     │   │   ├── PipelineDataService       # 数据获取与编排（项目→流水线→Job→日志）
     │   │   ├── ProjectSelectionService   # 项目树选择的数据层（顶级组 / 子组 / 直接项目）
+    │   │   ├── JobTraceResult            # 增量日志结果：内容 / 下一字节偏移 / UTF-8 carry / 全量标记
     │   │   ├── GitRepositoryUtil         # 收集窗口内所有项目的 Git 远程仓库
     │   │   ├── NotificationService       # 通知消息
     │   │   ├── GitLabEndpoints           # API 端点 / 参数常量
     │   │   ├── GitLabFieldNames          # JSON 字段名常量
     │   │   └── GitLabApiException        # API 异常（携带 HTTP 状态码）
     │   ├── settings/           # 配置持久化（GitLabSettings，存于 options/gitlab-pipeline-viewer.xml）
-    │   ├── ui/                 # 界面：主面板、日志视图、项目树选择器、设置 / 触发弹窗
     │   └── util/               # 工具类（JsonUtil / GitUrlUtil）
+    ├── kotlin/com/gitlab/pipeline/viewer/ui/     # UI 层（Kotlin + DSL builder）
+    │   ├── GitLabPipelinePanel.kt     # 主面板：三栏 ActionToolbar / 流水线表格 / 自动刷新与并发调度
+    │   ├── LogViewer.kt               # ConsoleView 日志视图：ANSI 解析 / BMH 搜索 / MarkupModel 高亮
+    │   ├── ProjectTreeSelector.kt / JobSelector.kt   # 项目 / Job 选择器（JBPopup 弹层）
+    │   ├── SettingsDialog.kt / TriggerPipelineDialog.kt   # 设置 / 触发流水线弹窗
+    │   └── selector/                  # ChooseByNamePopup 相关：模型 / 渲染器 / 弹层控制器
+    │       ├── ChooseByNamePopupController.kt
+    │       ├── ProjectChooseByNameModel.kt / JobChooseByNameModel.kt
+    │       └── RichListCellRenderers.kt
     └── resources/
         ├── META-INF/
         │   ├── plugin.xml      # 插件清单（工具窗口 / 通知组 / 配置项注册）
         │   └── pluginIcon.svg  # 插件 Logo（Settings → Plugins 列表中显示）
-        └── icons/              # 工具窗口图标
+        └── icons/gitlab-pipeline.svg   # 工具窗口图标
 ```
 
 ## 构建与安装
@@ -109,14 +136,14 @@ Windows 本地开发**直接在 IDEA 内构建即可，不需要命令行**：
 | 刷新项目 | 刷新项目 | 重新收集窗口内项目并重建项目组树 |
 | 刷新列表 | 刷新列表 | 重新加载当前项目当前页的流水线 |
 | 翻页 | 上一页 / 下一页 | 分页浏览更早的流水线 |
-| 触发流水线 | 触发流水线 | 弹窗选择 Ref、填写自定义变量后触发 |
+| 新建流水线 | 新建流水线 | 弹窗选择 Ref、填写自定义变量后新建 |
 | 取消流水线 | 取消流水线 | 仅运行 / 等待中的流水线可用 |
 | 重试流水线 | 重试流水线 | 仅失败 / 已取消的流水线可用 |
 | 执行 / 重试 Job | 执行 / 重试 | 执行 `when: manual` 作业；失败 / 已取消作业重试 |
 | 取消 Job | 取消Job | 仅运行 / 等待中的 Job 可用 |
-| 查看日志 | 点击 Job | 展示选中 Job 的完整构建日志（带 ANSI 着色） |
-| 日志搜索 | 搜索框 + 上一处 / 下一处 | 关键字高亮并跳转 |
-| 刷新日志 | 刷新 | 重新拉取选中 Job 的日志 |
+| 查看日志 | 点击 Job | ConsoleView 展示构建日志（动态追加、ANSI 着色、进度行保留） |
+| 日志搜索 | 搜索框 + 上一处 / 下一处 | BMH 快速匹配，关键字高亮并跳转 |
+| 刷新日志 | 刷新 | Range 增量拉取新增日志并追加；Job 结束自动全量替换 |
 
 ## 协议
 
