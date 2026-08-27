@@ -85,6 +85,15 @@ public final class GitLabEndpoints {
     // ---------------------------- 请求头与表单字段 ----------------------------
     public static final String HEADER_PRIVATE_TOKEN = "PRIVATE-TOKEN";
     public static final String HEADER_CONTENT_TYPE = "Content-Type";
+    /**
+     * HTTP Range 请求头：配合 JOB_TRACE 做日志增量拉取
+     * （GitLab 支持按字节范围返回 206 部分内容，其网页端即以此流式加载日志）
+     */
+    public static final String HEADER_RANGE = "Range";
+    /**
+     * 206 响应中的 Content-Range 响应头（形如 bytes 0-1023/146515），用于推进下一段偏移
+     */
+    public static final String HEADER_CONTENT_RANGE = "Content-Range";
     public static final String CONTENT_TYPE_FORM = "application/x-www-form-urlencoded";
     public static final String FORM_REF = "ref";
     /**

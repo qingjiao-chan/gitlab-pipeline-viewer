@@ -3,6 +3,9 @@ import java.util.Properties
 plugins {
     id("java")
     id("org.jetbrains.intellij") version "1.17.4"
+    // 引入 Kotlin 以便用 com.intellij.ui.dsl.builder 写面板（类型安全 builder，可读性 ×10）
+    // 1.9.25 是兼容 JDK 17 / IntelliJ 2023.2 的稳定版本
+    id("org.jetbrains.kotlin.jvm") version "1.9.25"
 }
 
 group = "com.gitlab.pipeline.viewer"
@@ -23,6 +26,21 @@ java {
 tasks.withType<JavaCompile>().configureEach {
     options.release.set(17)
     options.encoding = "UTF-8"
+}
+
+// Kotlin 与 Java 17 对齐：同一 JVM target，源码可被 Java 源互相引用
+kotlin {
+    jvmToolchain(17)
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    kotlinOptions {
+        jvmTarget = "17"
+        freeCompilerArgs = freeCompilerArgs + listOf(
+            // 与 Java 互操作：nullability 由注解描述；UI 层有大量 Java 互操作时不强制严格
+            "-Xjsr305=strict"
+        )
+    }
 }
 
 // 资源文件（如 META-INF/plugin.xml）统一按 UTF-8 处理，避免中文 Windows（GBK 默认字符集）下

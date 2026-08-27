@@ -15,6 +15,13 @@ public final class GitUrlUtil {
      * 提取 host（不含端口），用于判断是否为同一 GitLab 实例
      */
     public static String extractHost(String url) {
+        return stripPort(extractHostWithPort(url));
+    }
+
+    /**
+     * 提取 host（含端口，如有），用于与设置中的 GitLab 地址做域名+端口精确匹配
+     */
+    public static String extractHostWithPort(String url) {
         if (url == null) {
             return "";
         }
@@ -27,7 +34,7 @@ public final class GitUrlUtil {
             int colon = rest.indexOf(':');
             int slash = rest.indexOf('/');
             if (colon >= 0 && (slash < 0 || colon < slash)) {
-                return stripPort(rest.substring(0, colon));
+                return rest.substring(0, colon);
             }
         }
         int schemeIdx = u.indexOf("://");
@@ -43,7 +50,7 @@ public final class GitUrlUtil {
         if (at >= 0) {
             host = host.substring(at + 1);
         }
-        return stripPort(host);
+        return host;
     }
 
     /**

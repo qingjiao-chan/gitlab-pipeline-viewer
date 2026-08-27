@@ -1,6 +1,7 @@
 package com.gitlab.pipeline.viewer.services;
 
 import com.gitlab.pipeline.viewer.model.ProjectEntry;
+import com.gitlab.pipeline.viewer.settings.GitLabSettings;
 import com.gitlab.pipeline.viewer.util.GitUrlUtil;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.project.ProjectManager;
@@ -27,8 +28,11 @@ public final class GitRepositoryUtil {
     /**
      * 扫描当前 IDEA 窗口所有打开项目（含附加项目），提取每个 Git 远程仓库的
      * GitLab host + 项目路径，去重后返回。
+     * 仅保留与设置中 GitLab 域名+端口一致的远程仓库（设置为空时不过滤）。
      */
     public static @NotNull List<ProjectEntry> collectProjects() {
+        String configuredHostPort = GitUrlUtil.extractHostWithPort(
+                GitLabSettings.getInstance().getGitlabUrl());
         Map<String, ProjectEntry> map = new LinkedHashMap<>();
         for (Project project : ProjectManager.getInstance().getOpenProjects()) {
             if (project.isDisposed()) {
@@ -43,9 +47,15 @@ public final class GitRepositoryUtil {
             for (GitRepository repo : manager.getRepositories()) {
                 for (GitRemote remote : repo.getRemotes()) {
                     for (String url : remote.getUrls()) {
+                        String hostPort = GitUrlUtil.extractHostWithPort(url);
                         String host = GitUrlUtil.extractHost(url);
                         String path = GitUrlUtil.extractPath(url);
                         if (host.isEmpty() || path.isEmpty()) {
+                            continue;
+                        }
+                        // 设置中已配置 GitLab 地址时，只保留域名+端口一致的远程仓库
+                        if (!configuredHostPort.isEmpty()
+                                && !hostPort.equalsIgnoreCase(configuredHostPort)) {
                             continue;
                         }
                         String key = host + "/" + path;
