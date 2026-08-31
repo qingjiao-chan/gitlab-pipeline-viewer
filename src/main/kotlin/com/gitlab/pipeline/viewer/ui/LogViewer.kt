@@ -4,13 +4,7 @@ import com.intellij.execution.impl.ConsoleViewImpl
 import com.intellij.execution.ui.ConsoleView
 import com.intellij.execution.ui.ConsoleViewContentType
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.editor.ScrollType
-import com.intellij.openapi.editor.colors.EditorColors
-import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.TextAttributesKey
-import com.intellij.openapi.editor.markup.HighlighterLayer
-import com.intellij.openapi.editor.markup.HighlighterTargetArea
-import com.intellij.openapi.editor.markup.RangeHighlighter
 import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
@@ -23,10 +17,11 @@ import java.awt.Color
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridBagLayout
-import java.util.Arrays
 import java.util.concurrent.atomic.AtomicInteger
 import javax.swing.JLayeredPane
 import javax.swing.JPanel
+import javax.swing.JScrollBar
+import javax.swing.JScrollPane
 import javax.swing.UIManager
 
 /**
@@ -34,12 +29,13 @@ import javax.swing.UIManager
  * <p>
  * 相比自绘 JTextPane + StyledDocument，ConsoleView 以「追加式打印」渲染大日志：
  * - 性能好：IDEA 运行日志同款渲染，几十 MB 日志滚动不卡，天然自动跟随滚动；
- * - 动态追加：把新增增量直接 print 到控制台即可，不重建、不打断阅读位置与搜索定位；
- * - 原生外观：等宽字体、编辑器右键菜单（复制/全选）、Ctrl+F 查找等由 ConsoleView 自带。
+ * - 动态追加：把新增增量直接 print 到控制台即可，不重建、不打断阅读位置与鼠标选中
+ *   （追加只发生在文档末尾，追加后按「跟随底部与否」还原滚动/选中，像 IDEA 控制台一样
+ *   流畅追加，用户上翻阅读或选中文本时不会被拽走）；
+ * - 原生外观：等宽字体、编辑器右键菜单（复制/全选）、自带 Ctrl+F 查找等由 ConsoleView 提供。
  * <p>
  * 终端语义（\r 行首覆盖、ESC[K 清行、ANSI 前景色/加粗）仍在行缓冲里解析完成后才打印，
- * 保证「控制台显示内容 == 全文缓存 [plainText]」，搜索高亮不会错位。
- * 搜索用 Boyer-Moore-Horspool 快速匹配，高亮走编辑器 MarkupModel（千级高亮不卡 EDT）。
+ * 保证「控制台显示内容」与肉眼看到的一致。查找交给 ConsoleView 自带 Ctrl+F，不再自实现。
  */
 class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
 
@@ -55,29 +51,12 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
     private val loadingLabel: JBLabel = JBLabel(AnimatedIcon.Default.INSTANCE)
     private val loadingPanel: JPanel
 
-    // ---------------------------------------------------------------- 搜索状态
-    private val matches: MutableList<IntArray> = mutableListOf()
-    private var currentIndex = -1
-
-    /**
-     * 当前搜索关键字，切换日志后自动重新匹配
-     */
-    private var currentSearch: String = ""
-
-    /**
-     * 全文缓存：与 ConsoleView 显示内容逐字符一致（换行就是 '\n'），搜索与高亮共用这套坐标
-     */
-    private val plainText = StringBuilder()
+    // ---------------------------------------------------------------- 日志构建状态
 
     /**
      * 日志构建版本号：后台解析完成的日志只有最新一次 setLog 的才会被应用
      */
     private val logGeneration = AtomicInteger()
-
-    /**
-     * 增量追加的增量体积上限：超过后回退全量重建（在后台线程解析），避免大增量卡 EDT
-     */
-    private val maxAppendDelta = MAX_APPEND_DELTA
 
     /**
      * 已打印进控制台的原始日志文本；用于判断下次 setLog 是否可增量追加
@@ -92,24 +71,10 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
     private var pendingFg = -1
     private var pendingBold = false
 
-    /** 当前已画到编辑器上的高亮器，重画前统一移除 */
-    private val paintedHighlighters: MutableList<RangeHighlighter> = mutableListOf()
-    private val matchAttributes: TextAttributes
-    private val currentAttributes: TextAttributes
-
     /** ANSI 前景色 -> ConsoleViewContentType 缓存（16 色 × 加粗，首次用到时注册） */
     private val colorTypes = HashMap<Int, ConsoleViewContentType>()
 
     init {
-        matchAttributes = TextAttributes().apply {
-            backgroundColor = EditorColorsManager.getInstance().globalScheme
-                .getAttributes(EditorColors.SEARCH_RESULT_ATTRIBUTES)
-                ?.backgroundColor ?: Color(0xFFFFB0)
-        }
-        currentAttributes = TextAttributes().apply {
-            backgroundColor = Color(0xFFA500)
-        }
-
         // 加载占位层：spinner + 文案居中覆盖在日志区之上（默认隐藏，加载时显示）
         loadingLabel.text = " 正在加载日志…"
         val loadingRow = JPanel(FlowLayout(FlowLayout.CENTER, JBUI.scale(8), 0)).apply {
@@ -166,22 +131,24 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
     // ---------------------------------------------------------------- 日志内容
 
     /**
-     * 设置日志文本（解析 ANSI 颜色，保留搜索匹配）。
+     * 设置日志文本（解析 ANSI 颜色）。
      *
      * 增量优先：新日志若以已打印日志为前缀（自动刷新时多行日志逐次追加、\r 进度行覆盖），
-     * 只解析增量并追加到控制台 —— 控制台不重建，滚动位置、搜索定位、高亮都不被打断。
+     * 只解析增量并追加到控制台 —— 控制台不重建，滚动位置、鼠标选中都不被打断。
      */
     fun setLog(log: String?) {
         val text = log ?: ""
-        if (lastRenderedLog.isNotEmpty() && text.startsWith(lastRenderedLog)
-            && text.length > lastRenderedLog.length
-            && text.length - lastRenderedLog.length <= maxAppendDelta
-        ) {
+        // 增量优先：自动刷新时服务端返回的多是「整份日志」（200 全量，Range 常被忽略），
+        // 但只要新文本是已渲染内容的超集（前缀一致），就只追加增量 —— 不重建控制台，
+        // 滚动位置、鼠标选中都不会被重置，呈现"日志不断追加"的动态加载效果。
+        if (lastRenderedLog.isNotEmpty() && text.startsWith(lastRenderedLog)) {
+            if (text.length == lastRenderedLog.length) return    // 内容无变化：跳过，避免每次轮询都重建闪屏
             val delta = text.substring(lastRenderedLog.length)
             lastRenderedLog = text
             appendParsed(delta)
             return
         }
+        // 非增长（切换 Job / 内容变短 / 首屏）：全量重建
         lastRenderedLog = text
         val gen = logGeneration.incrementAndGet()
         if (text.isEmpty()) {
@@ -216,8 +183,26 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
     /**
      * 解析增量并打印：以持久终端状态为起点解析 [delta]，新完成的行打印到控制台。
      * 末尾未完成行保留在 [pendingLine]，等收到 \n 成为完整行后再打印。
+     *
+     * 追加只发生在文档末尾，既有文本的偏移/坐标都不变。追加前先快照阅读位置
+     * （跟随底部与否、鼠标选中范围、滚动偏移），追加后还原 —— 参考 IDEA 控制台：
+     * 用户没在看末尾就保持视口与选中不动；用户在看末尾才跟随新日志滚动。
      */
     private fun appendParsed(delta: String) {
+        val editing = editor
+        val sm = editing.selectionModel
+        // 追加前快照：是否有鼠标选中、选中范围、caret 位置、是否在数据流末尾、滚动偏移
+        val hadSelection = sm.hasSelection()
+        val selStart = if (hadSelection) sm.selectionStart else -1
+        val selEnd = if (hadSelection) sm.selectionEnd else -1
+        val caretOffset = editing.caretModel.offset
+        // 跟随底部判定：文档末尾那行的 Y 落在可视区下沿之内，即用户停留在末尾附近
+        val visible = editing.scrollingModel.getVisibleArea()
+        val maxVisibleY = visible.y + visible.height
+        val endY = editing.offsetToXY(editing.document.textLength).y
+        val followsBottom = endY <= maxVisibleY + editing.lineHeight / 2
+        val savedScroll = verticalScrollOffset()
+
         val st = TerminalState().apply {
             line.replaceWith(pendingLine)
             fg = pendingFg
@@ -228,8 +213,18 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
         pendingLine.replaceWith(st.line)
         pendingFg = st.fg
         pendingBold = st.bold
-        // 追加后重匹配（新内容可能产生新匹配；保持当前阅读定位）
-        rematch(false, currentMatchOffset())
+
+        // 还原选中：追加在末尾，选中偏移依然有效；直接重建选中，绝不因移动 caret 而清除，
+        // 否则用户鼠标选中的内容会在每次刷新后被取消/跳走。
+        if (hadSelection) {
+            sm.setSelection(selStart, selEnd)
+        } else if (!followsBottom && caretOffset <= editing.document.textLength) {
+            // 无选中且未跟随底部：把 caret 还原回原位（不越界），保持阅读位置
+            editing.caretModel.moveToOffset(caretOffset)
+        }
+        // 还原滚动：未跟随底部则把视口钉回原偏移（选中/阅读位置跳出视野的问题即源于此）；
+        // 跟随底部则滚到最新末尾，呈现「日志不断追加」的顺畅效果。
+        restoreScroll(savedScroll, followsBottom)
     }
 
     /**
@@ -238,28 +233,60 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
     private fun applyParsed(gen: Int, parsed: ParsedLog) {
         if (gen != logGeneration.get()) return // 已有更新的 setLog，本次构建过期
         consoleView.clear()
-        plainText.setLength(0)
         pendingFg = parsed.lastState.fg
         pendingBold = parsed.lastState.bold
         pendingLine.replaceWith(parsed.lastState.line)
         for (line in parsed.lines) {
             printLine(line)
         }
-        rematch(false, -1)
         hideLoading()
     }
 
     /**
-     * 把一行内容打印到控制台（按样式段 print），并同步维护全文缓存
-     * （缓存与显示逐字符一致，搜索高亮坐标系不错位）。
+     * 当前可视区垂直滚动偏移（像素）；找不到滚动条时返回 -1（不还原）
+     */
+    private fun verticalScrollOffset(): Int {
+        val sb = scrollBar() ?: return -1
+        return sb.value
+    }
+
+    /**
+     * 还原滚动位置：未跟随底部 → 钉回原偏移（保持阅读位置/选中不跳出视野）；
+     * 跟随底部 → 滚到内容最新末尾，呈现「日志不断追加」。
+     * 追加发生在同一次 EDT 事件内，还原与打印之间不会有绘制，因此不会闪屏。
+     */
+    private fun restoreScroll(saved: Int, followsBottom: Boolean) {
+        val sb = scrollBar() ?: return
+        if (followsBottom) {
+            // 跟到最新末尾；模型最大值可能还没在本次布局后刷新，推迟到下一帧执行更稳妥
+            ApplicationManager.getApplication().invokeLater {
+                sb.value = sb.maximum - sb.model.extent
+            }
+        } else if (saved >= 0 && sb.value != saved) {
+            sb.value = saved
+        }
+    }
+
+    /**
+     * 从 consoleView 组件向上找到包裹的滚动条（ConsoleViewImpl 内部编辑器在 ScrollPane 里）
+     */
+    private fun scrollBar(): JScrollBar? {
+        var c: java.awt.Component = consoleView.component
+        while (true) {
+            val p = c.parent ?: return null
+            if (p is JScrollPane) return p.verticalScrollBar
+            c = p
+        }
+    }
+
+    /**
+     * 把一行内容打印到控制台（按样式段 print）。
      */
     private fun printLine(line: Line) {
         line.eachSegment { text, fg, bold ->
             consoleView.print(text, contentType(fg, bold))
-            plainText.append(text)
         }
         consoleView.print("\n", ConsoleViewContentType.NORMAL_OUTPUT)
-        plainText.append('\n')
     }
 
     /**
@@ -295,165 +322,6 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
         }
     }
 
-    // ---------------------------------------------------------------- 搜索
-
-    fun setSearch(text: String?) {
-        currentSearch = text ?: ""
-        // 用户输入搜索时跳到第一个匹配，便于定位
-        rematch(true)
-    }
-
-    val matchCount: Int
-        get() = matches.size
-
-    /**
-     * 当前匹配序号（1 起），无匹配返回 0
-     */
-    val currentIndexDisplay: Int
-        get() = if (matches.isEmpty()) 0 else currentIndex + 1
-
-    fun findNext() {
-        if (matches.isEmpty()) return
-        currentIndex = (currentIndex + 1) % matches.size
-        highlightAll()
-        scrollToCurrent()
-    }
-
-    fun findPrev() {
-        if (matches.isEmpty()) return
-        currentIndex = (currentIndex - 1 + matches.size) % matches.size
-        highlightAll()
-        scrollToCurrent()
-    }
-
-    private fun currentMatchOffset(): Int =
-        if (currentIndex in matches.indices) matches[currentIndex][0] else -1
-
-    /**
-     * 按 currentSearch 重新匹配并高亮。
-     *
-     * 搜索基于 [plainText]（与控制台显示逐字符一致的纯文本缓存）而非编辑器文本：
-     * 后者的换行展开/平台行分隔符会让高亮偏移每行错开，导致「高亮内容和关键字不一致」。
-     * 匹配为区分大小写的字面查找，高亮子串必然与输入逐字符一致。
-     *
-     * @param scrollToFirst true=滚动到第一个匹配（用户输入搜索时）；
-     *                      false=保持当前阅读位置（日志刷新/自动刷新后重匹配时）
-     * @param keepOffset    日志刷新前当前匹配的起始偏移；重匹配后若该偏移处仍是匹配
-     *                      则保持当前匹配不跳走（-1=取第一个匹配）
-     */
-    private fun rematch(scrollToFirst: Boolean) {
-        rematch(scrollToFirst, -1)
-    }
-
-    private fun rematch(scrollToFirst: Boolean, keepOffset: Int) {
-        matches.clear()
-        currentIndex = -1
-        clearHighlights()
-        val needle = currentSearch
-        if (needle.isNotEmpty()) {
-            var idx = 0
-            while (true) {
-                val found = indexOfBmh(plainText, needle, idx)
-                if (found < 0) break
-                matches.add(intArrayOf(found, found + needle.length))
-                idx = found + needle.length
-            }
-        }
-        if (matches.isNotEmpty()) {
-            currentIndex = 0
-            // 日志刷新后保持当前搜索定位：旧匹配偏移在追加/重建中不会变化
-            if (keepOffset >= 0) {
-                for (i in matches.indices) {
-                    if (matches[i][0] == keepOffset) {
-                        currentIndex = i
-                        break
-                    }
-                }
-            }
-            highlightAll()
-            if (scrollToFirst) {
-                scrollToCurrent()
-            }
-        }
-    }
-
-    /**
-     * Boyer-Moore-Horspool 快速子串查找：比 String.indexOf 的朴素匹配快得多，
-     * 长日志 + 高频搜索（每敲一个字符）场景下显著降低 EDT 耗时。区分大小写的字面匹配。
-     */
-    private fun indexOfBmh(haystack: CharSequence, needle: CharSequence, from: Int): Int {
-        val n = needle.length
-        if (n == 0) return from
-        val m = haystack.length
-        if (from < 0 || n > m - from) return -1
-        // 坏字符表：needle 中除最后一个字符外，每个字符距末尾的距离；复用避免每次分配 256KB
-        val shift = bmhShift
-        Arrays.fill(shift, n)
-        for (i in 0 until n - 1) {
-            shift[needle[i].code] = n - 1 - i
-        }
-        var i = from + n - 1
-        while (i < m) {
-            var j = n - 1
-            var k = i
-            while (j >= 0 && haystack[k] == needle[j]) {
-                j--
-                k--
-            }
-            if (j < 0) return k + 1
-            i += shift[haystack[i].code]
-        }
-        return -1
-    }
-
-    /**
-     * 重画全部高亮。匹配数超过 [MAX_PAINTED_MATCHES] 时只画当前项
-     * （计数照常显示真实值）：短关键字在大日志里可能命中几万处，
-     * 全量画高亮每次按键都要上百毫秒，必然拖垮 EDT。
-     * 高亮走编辑器 MarkupModel（RangeHighlighter），比 Swing Highlighter 快一个数量级。
-     */
-    private fun highlightAll() {
-        clearHighlights()
-        if (matches.isEmpty()) return
-        val paintedCount = minOf(matches.size, MAX_PAINTED_MATCHES)
-        val markup = editor.markupModel
-        for (i in 0 until paintedCount) {
-            val m = matches[i]
-            paintedHighlighters.add(
-                markup.addRangeHighlighter(
-                    m[0], m[1], HighlighterLayer.SELECTION,
-                    if (i == currentIndex) currentAttributes else matchAttributes,
-                    HighlighterTargetArea.EXACT_RANGE
-                )
-            )
-        }
-        if (paintedCount < matches.size) {
-            // 超上限被裁剪的场景：当前项可能不在前 MAX_PAINTED_MATCHES 个里，单独补画
-            val m = matches[currentIndex]
-            paintedHighlighters.add(
-                markup.addRangeHighlighter(
-                    m[0], m[1], HighlighterLayer.SELECTION + 1,
-                    currentAttributes, HighlighterTargetArea.EXACT_RANGE
-                )
-            )
-        }
-    }
-
-    private fun clearHighlights() {
-        val markup = editor.markupModel
-        for (h in paintedHighlighters) {
-            markup.removeHighlighter(h)
-        }
-        paintedHighlighters.clear()
-    }
-
-    private fun scrollToCurrent() {
-        if (currentIndex !in matches.indices) return
-        val m = matches[currentIndex]
-        editor.caretModel.moveToOffset(m[0])
-        editor.scrollingModel.scrollToCaret(ScrollType.CENTER_UP)
-    }
-
     // ---------------------------------------------------------------- ANSI 解析
 
     /**
@@ -464,8 +332,7 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
      * - \u001B[..K：清行（0K=光标到行尾 / 1K=行首到光标 / 2K=整行）；
      * - 其余转义（光标移动、OSC 标题、ESC+单字符等）：整段跳过；
      * - 孤立 BEL（\u0007）：控制字符，不渲染。
-     * 保证控制台显示内容与终端/GitLab 界面看到的内容完全一致，
-     * 搜索高亮位置不会与肉眼看到的文字错位。
+     * 保证控制台显示内容与终端/GitLab 界面看到的内容完全一致。
      *
      * 末尾若还有未提交的「不完整行」（无 \n 结尾）不提交，保留在 [st.line] 里，
      * 供增量追加跨刷新以 \r 覆盖延续 —— 与 [appendParsed] 的语义保持一致。
@@ -566,7 +433,7 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
     /**
      * 终端式单行缓冲：支持 \r 行首覆盖、\e[K 清行，提交时按样式分段交给 [flushTo]。
      * 文本与样式都保存在行缓冲里，只有整行写完才打印，
-     * 从而保证控制台显示内容 == 终端可见文本，搜索偏移不错位。
+     * 从而保证控制台显示内容 == 终端可见文本。
      */
     private class Line {
         /**
@@ -582,11 +449,6 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
          * 下一个字符的写入位置（相对行首的字符偏移）
          */
         var cursor: Int = 0
-
-        /**
-         * 是否还有未提交的内容（用于末尾判断是否存在不完整行）
-         */
-        fun hasContent(): Boolean = segs.isNotEmpty()
 
         /**
          * 逐段交给消费方（打印到控制台 + 维护全文缓存）
@@ -785,14 +647,6 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
          * 全量解析改走后台线程的阈值（低于此值在 EDT 直接解析打印，减少一次线程切换）
          */
         private const val PARSE_BACKGROUND_THRESHOLD = 64 * 1024
-
-        private const val MAX_PAINTED_MATCHES = 1000
-        private const val MAX_APPEND_DELTA = 512 * 1024
-
-        /**
-         * BMH 坏字符表：复用同一块缓冲，避免每次搜索分配 256KB
-         */
-        private val bmhShift = IntArray(65536)
 
         /**
          * 16 色 ANSI 前景色码（30-37 普通 + 90-97 亮色）

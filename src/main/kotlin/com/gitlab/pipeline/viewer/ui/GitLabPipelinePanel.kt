@@ -26,7 +26,6 @@ import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowAnchor
 import com.intellij.ui.AnimatedIcon
 import com.intellij.ui.JBColor
-import com.intellij.ui.SearchTextField
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.util.ui.JBUI
@@ -44,14 +43,12 @@ import java.time.format.DateTimeFormatter
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import javax.swing.*
-import javax.swing.event.DocumentEvent
-import javax.swing.event.DocumentListener
 import javax.swing.table.DefaultTableCellRenderer
 import javax.swing.table.DefaultTableModel
 import javax.swing.table.TableColumnModel
 
 /**
- * 主面板：项目下拉 -> 流水线表格 -> Job 选择 -> 可搜索日志。
+ * 主面板：项目下拉 -> 流水线表格 -> Job 选择 -> 日志查看（ConsoleView，自带 Ctrl+F 查找）。
  *
  * —— IDEA 插件开发核心概念（对标 Spring Boot）——
  * 1. EDT（Event Dispatch Thread）：Swing 的 UI 主线程。所有控件操作必须在 EDT 上做。
@@ -139,8 +136,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     private val retryJobAction = RetryJobAction()
     private val refreshLogAction = RefreshLogAction()
     private val settingsAction = SettingsAction()
-    private val findPrevAction = FindPrevAction()
-    private val findNextAction = FindNextAction()
 
     // ============================================================ 控件
     private val projectSelector: ProjectTreeSelector = ProjectTreeSelector(ideaProject)
@@ -148,8 +143,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     // 必须传 ideaProject：JobSelector 内部的 ChooseByNamePopup 需要非空 project 计算 searchScope
     private val jobSelector: JobSelector = JobSelector(ideaProject)
     private val logViewer: LogViewer = LogViewer(ideaProject)
-    private val searchField: SearchTextField = SearchTextField()
-    private val matchLabel: JBLabel = JBLabel("").also { it.horizontalAlignment = SwingConstants.LEFT }
 
     private val pipelineModel: DefaultTableModel = object : DefaultTableModel(
         arrayOf("流水线", "状态", "Ref", "SHA", "来源", "创建时间", "耗时", "触发人"), 0
@@ -288,15 +281,12 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         pipelinePanel.add(tableScroll, BorderLayout.CENTER)
         pipelinePanel.add(pipelineToolbarPanel, BorderLayout.SOUTH)
 
-        // -------------------- 日志工具条（Job 选择 + 取消/重试/刷新 + 搜索 + 上一处/下一处）
+        // -------------------- 日志工具条（Job 选择 + 取消/重试/刷新）
         val logGroup = DefaultActionGroup().apply {
             add(cancelJobAction)
             add(retryJobAction)
             addSeparator()
             add(refreshLogAction)
-            addSeparator()
-            add(findPrevAction)
-            add(findNextAction)
         }
         val logTb = ActionManager.getInstance()
             .createActionToolbar("GitLab.Pipeline.LogToolbar", logGroup, true)
@@ -313,10 +303,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         jobSelector.addJobSelectionListener { onJobSelected() }
         logTop.add(jobSelector)
         logTop.add(logTb.component)
-        logTop.add(JBLabel("  搜索:"))
-        searchField.preferredSize = Dimension(JBUI.scale(180), JBUI.scale(26))
-        logTop.add(searchField)
-        logTop.add(matchLabel)
 
         // 关键：Y_AXIS BoxLayout 在 logViewer preferredSize 很小时（如空日志）会把多余空间分给
         // 其它"可扩展"组件，导致 logTop 被撑高；改用 BorderLayout 即可让 NORTH 工具条保持
@@ -350,15 +336,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         pipelineTable.selectionModel.addListSelectionListener {
             if (!it.valueIsAdjusting) onPipelineSelected()
         }
-        searchField.textEditor.addActionListener {
-            logViewer.findNext()
-            updateMatchLabel()
-        }
-        searchField.addDocumentListener(object : DocumentListener {
-            override fun insertUpdate(e: DocumentEvent) = onSearchChanged()
-            override fun removeUpdate(e: DocumentEvent) = onSearchChanged()
-            override fun changedUpdate(e: DocumentEvent) = onSearchChanged()
-        })
 
         updateActionButtons()
         updatePageControls()
@@ -423,20 +400,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         }
         p.add(toolbar)
         return p
-    }
-
-    private fun onSearchChanged() {
-        logViewer.setSearch(searchField.text)
-        updateMatchLabel()
-    }
-
-    private fun updateMatchLabel() {
-        val count = logViewer.matchCount
-        matchLabel.text = if (count == 0) {
-            if (searchField.text.isEmpty()) "" else "  0 处匹配"
-        } else {
-            "  ${logViewer.currentIndexDisplay}/$count"
-        }
     }
 
     // ============================================================ 项目
@@ -1081,8 +1044,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         retryJobAction.complete()
         refreshLogAction.complete()
         settingsAction.complete()
-        findPrevAction.complete()
-        findNextAction.complete()
     }
 
     // ============================================================ 停靠 / 分栏
@@ -1373,38 +1334,6 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
             if (isLoading) return
             super.run()       // 置 isLoading=true 并同步打开模态弹窗
             complete()        // 弹窗为同步模态，关闭后立即恢复按钮可用
-        }
-    }
-
-    private inner class FindPrevAction :
-        GitLabAction("上一处", "在日志中跳到上一个匹配", AllIcons.Actions.PreviousOccurence) {
-        override val loadingSpinnerEnabled: Boolean = false
-        override fun computeEnabled(): Boolean = !isLoading
-        override fun doPerform() {
-            try {
-                logViewer.findPrev()
-                updateMatchLabel()
-            } finally {
-                val t = Timer(250) { isLoading = false }
-                t.isRepeats = false
-                t.start()
-            }
-        }
-    }
-
-    private inner class FindNextAction :
-        GitLabAction("下一处", "在日志中跳到下一个匹配", AllIcons.Actions.NextOccurence) {
-        override val loadingSpinnerEnabled: Boolean = false
-        override fun computeEnabled(): Boolean = !isLoading
-        override fun doPerform() {
-            try {
-                logViewer.findNext()
-                updateMatchLabel()
-            } finally {
-                val t = Timer(250) { isLoading = false }
-                t.isRepeats = false
-                t.start()
-            }
         }
     }
 
