@@ -238,26 +238,44 @@ public class GitLabApiService {
         HttpResponse<byte[]> resp = client.send(builder.GET().build(), HttpResponse.BodyHandlers.ofByteArray());
         int code = resp.statusCode();
         if (code == 416) {
-            // 请求偏移已到日志末尾：没有新内容可追加
-            return new JobTraceResult("", fromByte, new byte[0], false);
+            // 请求偏移已到日志末尾：没有新内容可追加；carry 保留，若日志后续追加仍可无缝拼接
+            return new JobTraceResult("", fromByte, carry, false);
         }
         if (code != 200 && code != 206) {
             throw new GitLabApiException(code, new String(resp.body(), StandardCharsets.UTF_8));
         }
         boolean partial = code == 206;
         byte[] body = resp.body() == null ? new byte[0] : resp.body();
-        // 206=增量：拼上上次未完成的多字节尾部再解码；200=完整内容，从头部解码，丢弃上次 carry
-        byte[] merged = partial ? concat(carry, body) : body;
-        Utf8Split split = splitUtf8(merged);
-        long nextOffset;
-        if (partial) {
-            String cr = resp.headers().firstValue(GitLabEndpoints.HEADER_CONTENT_RANGE).orElse(null);
-            long end = cr == null ? -1 : contentRangeEnd(cr);
-            nextOffset = end >= 0 ? end + 1 : fromByte + body.length;
-        } else {
-            nextOffset = split.text.getBytes(StandardCharsets.UTF_8).length;
+
+        if (!partial) {
+            // 200 完整响应：要么是首屏（fromByte==0），要么是服务器忽略了 Range 又返回整份日志。
+            if (fromByte <= 0) {
+                // 首屏：整份解码；carry 为末尾未完成的多字节尾部
+                Utf8Split split = splitUtf8(body);
+                return new JobTraceResult(
+                        split.text, split.text.getBytes(StandardCharsets.UTF_8).length, split.carry, true);
+            }
+            // Range 被服务器忽略：在客户端从整份返回里切出 [fromByte, 末尾) 作为增量。
+            // 否则每次自动刷新都会重新下载/替换/重建整份大日志，表现为日志"突然一下输出大量、不流畅"。
+            if (fromByte >= body.length) {
+                // 已推进到日志末尾，无新内容
+                return new JobTraceResult("", fromByte, carry, false);
+            }
+            int start = (int) fromByte;
+            byte[] tail = Arrays.copyOfRange(body, start, body.length);
+            byte[] merged = concat(carry, tail);
+            Utf8Split split = splitUtf8(merged);
+            // 本次已把 [fromByte, 文件末尾) 一眼拿全，offset 推进到末尾；作为增量追加（full=false）
+            return new JobTraceResult(split.text, body.length, split.carry, false);
         }
-        return new JobTraceResult(split.text, nextOffset, split.carry, !partial);
+
+        // 206 部分响应（Range 生效）：body = [fromByte, serverEnd)，拼上上次未完成的多字节尾部再解码
+        byte[] merged = concat(carry, body);
+        Utf8Split split = splitUtf8(merged);
+        String cr = resp.headers().firstValue(GitLabEndpoints.HEADER_CONTENT_RANGE).orElse(null);
+        long end = cr == null ? -1 : contentRangeEnd(cr);
+        long nextOffset = end >= 0 ? end + 1 : fromByte + body.length;
+        return new JobTraceResult(split.text, nextOffset, split.carry, false);
     }
 
     private static byte[] concat(byte[] a, byte[] b) {
