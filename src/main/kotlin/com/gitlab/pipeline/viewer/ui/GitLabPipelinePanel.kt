@@ -642,7 +642,9 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
                             logViewer.appendLog(result.content)
                         }
                         val cur = jobSelector.selectedJob
-                        if (cur != null && cur.status != fresh.status) {
+                        if (cur != null && cur.id == fresh.id) {
+                            // 无条件同步同一 Job 的最新实体（含最新状态）：任务完成后立即把缓存态
+                            // 置为非 active，autoRefreshTimer 下个周期即据此停止轮询，避免"已完成还在取日志"
                             jobSelector.replaceSelectedJob(fresh)
                         }
                         if (freshPipeline != null) {
