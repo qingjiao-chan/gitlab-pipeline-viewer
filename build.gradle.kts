@@ -84,6 +84,10 @@ tasks {
         untilBuild.set("")
     }
 
+    publishPlugin {
+        token.set(System.getenv("JETBRAINS_TOKEN"))
+    }
+
     // ---- 本地调试 ----
     // 1. 默认方式：gradle runIde 会拉起一个带插件的新 IDEA 窗口，可直接点按钮验证功能。
     //

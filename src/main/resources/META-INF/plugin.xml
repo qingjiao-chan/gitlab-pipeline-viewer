@@ -13,19 +13,53 @@
 <idea-plugin>
     <id>com.gitlab.pipeline.viewer</id>
     <name>GitLab Pipeline Viewer</name>
-    <vendor>qingjiao chan</vendor>
+    <!--（Marketplace 注册厂商账号、接收上架通知都要用到，留空或伪造会导致上传被拒绝）。url 指向项目主页。 -->
+    <vendor email="lzwlwlc@163.com" url="https://github.com/qingjiao-chan/gitlab-pipeline-viewer">qingjiao chan</vendor>
     <version>1.0.0</version>
 
     <description><![CDATA[
-    <p>直接在 IntelliJ IDEA 中查看、触发和管理多个 GitLab 项目的 CI/CD 流水线，无需切换浏览器。</p>
+    <p>在 IntelliJ IDEA 中直接查看、触发和管理 <b>GitLab CI/CD 流水线</b>，
+    无需切换浏览器即可完成「查看流水线状态 → 查看构建日志 → 触发 / 重试 / 取消」的完整闭环。</p>
+
+    <p><b>核心功能</b></p>
     <ul>
-        <li>自动识别当前窗口内所有项目的 Git 远程仓库，支持按 GitLab 项目组树选择目标项目</li>
-        <li>浏览流水线列表与状态（成功 / 失败 / 运行中 / 等待中 / 已取消），并显示耗时与触发人</li>
-        <li>一键新建流水线（支持自定义 CI/CD 变量），取消 / 重试流水线或单个 Job</li>
-        <li>查看 Job 完整构建日志，支持关键字搜索、高亮与上一处 / 下一处跳转</li>
-        <li>选中运行中的流水线时自动刷新构建日志</li>
+        <li><b>项目自动识别</b>：自动收集当前窗口内所有项目（含附加模块）的 Git 远程仓库，
+            支持按 GitLab 项目组树选择目标项目（按需懒加载）</li>
+        <li><b>流水线列表</b>：状态 / Ref / SHA / 来源 / 创建时间 / 耗时 / 触发人，支持分页浏览更早的流水线</li>
+        <li><b>新建流水线</b>：选择分支或手动输入 Ref，支持填写自定义 CI/CD 变量（key=value）</li>
+        <li><b>取消 / 重试</b>：流水线级与 Job 级均支持；可执行 <code>when: manual</code> 手动作业</li>
+        <li><b>构建日志</b>：ConsoleView 展示，ANSI 着色、动态追加、增量拉取，关键字搜索与高亮跳转</li>
+        <li><b>自动刷新</b>：运行中的流水线按可配置间隔自动增量刷新日志</li>
+        <li><b>布局自适应</b>：工具窗口停靠侧边上下分栏，停靠底部 / 顶部自动切换为左右分栏</li>
     </ul>
+
+    <p><b>兼容性</b></p>
+    <ul>
+        <li>IntelliJ IDEA 2023.1 及以上</li>
+        <li>支持 GitLab.com 与自建 GitLab（REST API v4，令牌需勾选 <code>api</code> 权限）</li>
+    </ul>
+
+    <p><b>代码地址</b></p>
+    <ul>
+        <!-- GitHub 地址为占位，创建仓库后请替换为真实地址 -->
+        <li><a href="https://github.com/qingjiao-chan/gitlab-pipeline-viewer">GitHub</a></li>
+        <li><a href="https://gitee.com/qingjiao-chan/gitlab-pipeline-viewer">Gitee</a></li>
+    </ul>
+
+    <p><i>本插件为独立开发的开源扩展，基于 Apache License 2.0 发布，
+    非 JetBrains 或 GitLab 官方产品。</i></p>
     ]]></description>
+
+    <change-notes><![CDATA[
+    <h3>1.0.0</h3>
+    <ul>
+        <li>首个正式版本发布</li>
+        <li>多 GitLab 项目流水线查看：状态 / Ref / 耗时 / 触发人，支持分页浏览</li>
+        <li>新建流水线（自定义 CI/CD 变量）、取消 / 重试流水线与单个 Job、执行手动 Job</li>
+        <li>Job 构建日志查看：ANSI 着色、增量刷新、关键字搜索与高亮跳转</li>
+        <li>基于 IntelliJ IDEA 2023.2 构建，兼容 2023.1+ 版本</li>
+    </ul>
+    ]]></change-notes>
 
     <!-- 依赖：类似 Spring Boot 的 starter，缺少时插件无法启动。
          Git 插件 id 是 "Git4Idea"（注意大小写），写错会导致依赖解析失败。 -->
