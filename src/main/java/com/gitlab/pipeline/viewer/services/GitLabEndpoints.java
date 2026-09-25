@@ -15,6 +15,10 @@ public final class GitLabEndpoints {
      * API 版本前缀
      */
     public static final String API_V4 = "/api/v4";
+    /**
+     * 当前令牌对应的用户（「测试连接」用）
+     */
+    public static final String USER = "/user";
 
     // ---------------------------- 资源路径模板（%s 为 path 参数占位） ----------------------------
     /**
@@ -94,6 +98,16 @@ public final class GitLabEndpoints {
      * 206 响应中的 Content-Range 响应头（形如 bytes 0-1023/146515），用于推进下一段偏移
      */
     public static final String HEADER_CONTENT_RANGE = "Content-Range";
+    /**
+     * 429 / 503 限流时服务端给出的建议等待时间（delta-seconds 或 HTTP-date）
+     */
+    public static final String HEADER_RETRY_AFTER = "Retry-After";
+    /**
+     * 分页响应头：总页数 / 总条数 / Link（rel="next"）
+     */
+    public static final String HEADER_TOTAL_PAGES = "X-Total-Pages";
+    public static final String HEADER_TOTAL = "X-Total";
+    public static final String HEADER_LINK = "Link";
     public static final String CONTENT_TYPE_FORM = "application/x-www-form-urlencoded";
     public static final String FORM_REF = "ref";
     /**

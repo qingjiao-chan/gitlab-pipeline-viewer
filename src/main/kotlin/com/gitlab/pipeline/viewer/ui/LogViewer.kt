@@ -142,10 +142,16 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
         // 但只要新文本是已渲染内容的超集（前缀一致），就只追加增量 —— 不重建控制台，
         // 滚动位置、鼠标选中都不会被重置，呈现"日志不断追加"的动态加载效果。
         if (lastRenderedLog.isNotEmpty() && text.startsWith(lastRenderedLog)) {
-            if (text.length == lastRenderedLog.length) return    // 内容无变化：跳过，避免每次轮询都重建闪屏
+            if (text.length == lastRenderedLog.length) {
+                // 内容无变化：跳过，避免每次轮询都重建闪屏；但数据确实已到达，
+                // 必须隐藏加载遮罩，否则「刷新列表」后遮罩会永久停留在日志区
+                hideLoading()
+                return
+            }
             val delta = text.substring(lastRenderedLog.length)
             lastRenderedLog = text
             appendParsed(delta)
+            hideLoading()
             return
         }
         // 非增长（切换 Job / 内容变短 / 首屏）：全量重建
@@ -178,6 +184,8 @@ class LogViewer(private val project: Project) : JPanel(BorderLayout()) {
         // 否则后续 setLog(累积全文) 会被前缀判断误判为增量再次追加，导致日志重复
         lastRenderedLog += delta
         appendParsed(delta)
+        // 增量到达同样意味着数据通道正常，任何残留加载遮罩都应撤下
+        hideLoading()
     }
 
     /**

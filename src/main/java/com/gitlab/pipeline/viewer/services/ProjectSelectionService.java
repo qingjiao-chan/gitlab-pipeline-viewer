@@ -57,14 +57,14 @@ public final class ProjectSelectionService {
 
     private GitLabApiService api() {
         GitLabSettings s = GitLabSettings.getInstance();
-        return new GitLabApiService(s.getGitlabUrl(), s.getToken(), s.getRequestTimeoutSeconds());
+        return new GitLabApiService(s.getActiveAccountId(), s.getGitlabUrl(), s.getToken(), s.getRequestTimeoutSeconds());
     }
 
     /**
      * 加载第一层顶级项目组（用于树形选择的根级懒加载）
      */
     public List<GroupEntry> loadRootGroups() throws Exception {
-        return api().listRootGroups(200);
+        return api().listRootGroups();
     }
 
     /**
@@ -74,9 +74,9 @@ public final class ProjectSelectionService {
      */
     public GroupChildrenView loadChildren(long groupId, @NotNull String parentGroupName) throws Exception {
         GitLabApiService api = api();
-        List<GroupEntry> subGroups = api.listSubGroups(groupId, 200);
+        List<GroupEntry> subGroups = api.listSubGroups(groupId);
         List<ProjectEntry> projects = new ArrayList<>();
-        for (GitLabProject gp : api.listDirectProjects(groupId, 200)) {
+        for (GitLabProject gp : api.listDirectProjects(groupId)) {
             if (gp.pathWithNamespace == null || gp.pathWithNamespace.isEmpty()) {
                 continue;
             }
@@ -128,7 +128,7 @@ public final class ProjectSelectionService {
             // 1) 加载顶级组
             List<GroupEntry> roots;
             try {
-                roots = sharedApi.listRootGroups(200);
+                roots = sharedApi.listRootGroups();
             } catch (Exception e) {
                 LOG.warn("loadAllProjects: failed to load root groups", e);
                 cachedAllProjects = Collections.emptyList();
@@ -196,9 +196,9 @@ public final class ProjectSelectionService {
             @NotNull GroupEntry group,
             @NotNull List<ProjectEntry> result
     ) throws Exception {
-        List<GroupEntry> subGroups = api.listSubGroups(group.id, 200);
+        List<GroupEntry> subGroups = api.listSubGroups(group.id);
         List<ProjectEntry> projects = new ArrayList<>();
-        for (GitLabProject gp : api.listDirectProjects(group.id, 200)) {
+        for (GitLabProject gp : api.listDirectProjects(group.id)) {
             if (gp.pathWithNamespace == null || gp.pathWithNamespace.isEmpty()) continue;
             // 用 group.fullPath 作为父组路径（保留完整层级，供弹窗副行渲染）
             projects.add(new ProjectEntry(group.name, "", "", gp.pathWithNamespace));
@@ -211,7 +211,7 @@ public final class ProjectSelectionService {
      * 清空底层 API 缓存 + 全量加载结果缓存
      */
     public void clearCache() {
-        GitLabApiService.clearCache();
+        GitLabApiService.clearAccountCache(GitLabSettings.getInstance().getActiveAccountId());
         cachedAllProjects = null;
     }
 }

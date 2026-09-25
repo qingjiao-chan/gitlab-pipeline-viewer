@@ -74,6 +74,11 @@ class ProjectTreeSelector(@NotNull private val ideaProject: Project) : JPanel(Bo
         private set
 
     /**
+     * 当前窗口检测到的项目是否来自多个 GitLab host：为 true 时项目节点追加 @host 归属标注
+     */
+    private var multiHost = false
+
+    /**
      * 重新加载的版本号：手动刷新后丢弃过期异步结果
      */
     private var reloadGen: Long = 0
@@ -125,8 +130,9 @@ class ProjectTreeSelector(@NotNull private val ideaProject: Project) : JPanel(Bo
                 if (value is DefaultMutableTreeNode) {
                     when (val uo = value.userObject) {
                         is ProjectEntry -> {
-                            // 只显示最后一级项目名，层级由树结构体现（path 放在 tooltip）
-                            text = uo.toString()
+                            // 只显示最后一级项目名，层级由树结构体现（path 放在 tooltip）；
+                            // 多账号（多 host）时追加 @host 归属标注
+                            text = if (multiHost) uo.toString() + "  @${uo.host}" else uo.toString()
                             toolTipText = uo.path
                         }
 
@@ -220,6 +226,7 @@ class ProjectTreeSelector(@NotNull private val ideaProject: Project) : JPanel(Bo
         if (projects.isEmpty()) {
             currentNode.add(DefaultMutableTreeNode(EMPTY_LABEL))
         }
+        multiHost = projects.map { it.host.lowercase() }.distinct().size > 1
         treeModel.nodeStructureChanged(currentNode)
         // 尝试恢复上次选择的项目（仅限当前窗口项目，静默恢复，不触发回调）；
         // 未恢复成功时默认选中第一个当前窗口项目
@@ -245,6 +252,21 @@ class ProjectTreeSelector(@NotNull private val ideaProject: Project) : JPanel(Bo
     fun addProjectSelectionListener(@NotNull listener: (ProjectEntry) -> Unit) {
         listeners.add(listener)
     }
+
+    /**
+     * 静默设置当前选中项目（不触发选择回调、不关闭弹层）：账号切换后由主面板指定
+     * 属于该账号的检测项目；entry 为 null 时清空显示。
+     */
+    fun selectProjectQuiet(entry: ProjectEntry?) {
+        selectedProject = entry
+        displayField.text = entry?.path ?: ""
+        displayField.toolTipText = entry?.path ?: "点击选择项目"
+    }
+
+    /**
+     * 清空选中项与展示（账号切换到无匹配本地仓库的账号时使用）
+     */
+    fun clearSelection() = selectProjectQuiet(null)
 
     /**
      * 手动刷新：清缓存、重置组树，并立即重新加载顶级项目组

@@ -4,15 +4,25 @@ import com.gitlab.pipeline.viewer.model.*;
 import com.gitlab.pipeline.viewer.util.JsonUtil;
 import com.google.gson.*;
 
+import java.io.IOException;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.security.cert.CertificateException;
 import java.time.Duration;
+
+import javax.net.ssl.SSLException;
+
+import com.intellij.util.net.HttpConfigurable;
+import com.intellij.util.net.ssl.CertificateManager;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,18 +45,50 @@ import java.util.function.Function;
  * - 流水线列表 / Job 列表：短 TTL（兼顾自动刷新实时性与接口频率）
  * - Job 日志：不缓存（内容随构建实时变化）
  * 缓存用 static 共享，因为面板每次操作都会 new 一个客户端实例；
- * key 是完整请求 URL（含项目/流水线 id），多项目间不会串数据。
+ * key = 账号 id + 完整请求 URL（含项目/流水线 id），多账号/多项目间不会串数据；
+ * 容量上限 200（LRU），写操作成功后仅失效当前账号。
+ * <p>
+ * HttpClient 也按「服务器 + 连接超时」static 复用（线程安全、共享连接池）。
+ * GET 请求遇到 429/502/503/504/瞬时网络异常自动重试（最多 2 次，429 尊重 Retry-After），
+ * POST 绝不重试。
  */
 public class GitLabApiService {
+
+    /** 缓存条目上限：LRU 淘汰，防止长期运行后缓存无限增长（多账号/多项目共享） */
+    private static final int MAX_CACHE_ENTRIES = 200;
+
+    /** GET 请求失败后的最大尝试次数（含首次），即最多重试 2 次 */
+    private static final int MAX_ATTEMPTS = 3;
+
+    /** 429 Retry-After 的等待上限，避免服务端要求长时间挂起 */
+    private static final long RETRY_AFTER_CAP_MS = 20_000;
+
+    private final String accountId;
     private final String baseUrl;
     private final String token;
     private final HttpClient client;
     private final Duration timeout;
 
     /**
-     * 共享 TTL 缓存：key = 完整请求 URL
+     * HttpClient 复用池：{@link java.net.http.HttpClient} 线程安全且内部持有连接池与
+     * selector 线程；过去每次「new 一个 API 客户端」都连带新建 HttpClient，频繁操作会
+     * 累积 TCP/TLS 握手与后台线程。按「服务器地址 + 连接超时」复用，令牌不参与 key
+     * （认证头逐请求携带），切账号不会误用旧令牌。
      */
-    private static final Map<String, CacheEntry> CACHE = new ConcurrentHashMap<>();
+    private static final Map<String, HttpClient> CLIENTS = new ConcurrentHashMap<>();
+
+    /**
+     * 账号级共享 TTL 缓存：key = accountId + 分隔符 + 完整请求 URL。
+     * 用 access-order LinkedHashMap 做 LRU（上限 {@link #MAX_CACHE_ENTRIES}），
+     * 写入时顺带清理过期项；所有访问在 synchronized 块内完成。
+     */
+    private static final Map<String, CacheEntry> CACHE =
+            Collections.synchronizedMap(new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+                    return size() > MAX_CACHE_ENTRIES;
+                }
+            });
 
     // ---- 各类接口的缓存 TTL（毫秒） ----
     private static final long TTL_PROJECT_INFO = 300_000;   // 项目信息/分支/项目组：几乎不变
@@ -64,15 +106,41 @@ public class GitLabApiService {
         }
     }
 
-    public GitLabApiService(String baseUrl, String token, int timeoutSeconds) {
+    public GitLabApiService(String accountId, String baseUrl, String token, int timeoutSeconds) {
+        this.accountId = accountId == null ? "" : accountId;
         this.baseUrl = (baseUrl == null ? "" : baseUrl).replaceAll("/+$", "");
         this.token = token == null ? "" : token;
         long timeoutSec = Math.max(5, timeoutSeconds);
-        this.client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(timeoutSec))
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
+        String clientKey = this.baseUrl + "#" + timeoutSec;
+        this.client = CLIENTS.computeIfAbsent(clientKey, k -> buildHttpClient(timeoutSec));
         this.timeout = Duration.ofSeconds(Math.max(15, timeoutSec * 6));
+    }
+
+    /**
+     * 构造共享 HttpClient：
+     * - SSLContext 接入平台 {@link CertificateManager}，使 IDE 已接受（含自签名/内网 CA）的
+     *   服务器证书对插件同样生效；未接受的证书由平台弹出标准确认框；平台不可用时退回 JDK 默认。
+     * - ProxySelector 使用 IDE 代理设置（Settings → Appearance → System Settings → HTTP Proxy），
+     *   与浏览器/IDEA 自身网络行为保持一致。
+     */
+    private static HttpClient buildHttpClient(long timeoutSec) {
+        HttpClient.Builder builder = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(timeoutSec))
+                .followRedirects(HttpClient.Redirect.NORMAL);
+        try {
+            builder.sslContext(CertificateManager.getInstance().getSslContext());
+        } catch (Throwable t) {
+            // 平台证书组件不可用时保持 JDK 默认 SSLContext
+        }
+        try {
+            ProxySelector selector = HttpConfigurable.getInstance().getOnlyBySettingsSelector();
+            if (selector != null) {
+                builder.proxy(selector);
+            }
+        } catch (Throwable t) {
+            // 代理组件不可用时走直连
+        }
+        return builder.build();
     }
 
     /**
@@ -121,6 +189,16 @@ public class GitLabApiService {
     }
 
     /**
+     * 获取当前令牌对应的用户（GET /user）。用于设置中的「测试连接」：
+     * 成功即说明地址可达且令牌有效。不做缓存（设置场景按需调用）。
+     */
+    public CurrentUser getCurrentUser() throws Exception {
+        String url = api(GitLabEndpoints.USER);
+        // 连接测试语义：只请求一次（错误地址/坏网络下不必等 3×超时），结果由调用方就地展示
+        return CurrentUser.from(executeJsonNoRetry(get(url).GET().build()).getAsJsonObject());
+    }
+
+    /**
      * 获取流水线列表（按 id 倒序，最新在前），支持分页；page 从 1 开始
      */
     public List<PipelineInfo> listPipelines(long projectId, int perPage, int page) throws Exception {
@@ -134,76 +212,170 @@ public class GitLabApiService {
         return mapArray(cachedGet(url, TTL_LIST_CACHE));
     }
 
+    // ---- 分页拉取的页大小与硬性总量上限（GitLab per_page 最大只接受 100） ----
+    private static final int PAGE_SIZE = 100;
+    /** 单条流水线的 Job 数硬上限：极端 include 矩阵可能产生数千 Job，必须截断防止失控 */
+    private static final int HARD_CAP_JOBS = 500;
+    /** 组 / 组下项目的硬上限：组树选择器按层懒加载，单层 2000 足够覆盖大型实例 */
+    private static final int HARD_CAP_GROUPS = 2000;
+    /** 分支硬上限：触发弹窗的分支选择，超大仓库截断保护，后续可加搜索参数 */
+    private static final int HARD_CAP_BRANCHES = 1000;
+
     /**
-     * 获取流水线下的 Job 列表
+     * 获取流水线下的完整 Job 列表（自动翻页，最多 {@link #HARD_CAP_JOBS} 个）。
+     * 旧实现固定 per_page=100 只拉第一页，Job 超过 100 的流水线会静默丢失作业。
      */
     public List<JobInfo> listJobs(long projectId, long pipelineId) throws Exception {
-        String url = apiQuery(GitLabEndpoints.PIPELINE_JOBS,
-                query(Map.of(GitLabEndpoints.PARAM_PER_PAGE, String.valueOf(100))),
-                projectId, pipelineId);
-        return mapJobs(cachedGet(url, TTL_LIST_CACHE));
+        JsonArray all = pagedGet(GitLabEndpoints.PIPELINE_JOBS, null,
+                PAGE_SIZE, HARD_CAP_JOBS, TTL_LIST_CACHE, projectId, pipelineId);
+        return mapJobs(all);
     }
 
     /**
-     * 获取项目分支列表（按名称升序）
+     * 获取项目完整分支列表（按名称升序，自动翻页，最多 {@link #HARD_CAP_BRANCHES} 个）
      */
     public List<BranchInfo> listBranches(long projectId) throws Exception {
-        String url = apiQuery(GitLabEndpoints.BRANCHES,
-                query(Map.of(
-                        GitLabEndpoints.PARAM_PER_PAGE, String.valueOf(100),
-                        GitLabEndpoints.PARAM_SORT, GitLabEndpoints.BRANCH_SORT)),
-                projectId);
-        return mapArray(cachedGet(url, TTL_PROJECT_INFO), BranchInfo::from);
+        JsonArray all = pagedGet(GitLabEndpoints.BRANCHES,
+                Map.of(GitLabEndpoints.PARAM_SORT, GitLabEndpoints.BRANCH_SORT),
+                PAGE_SIZE, HARD_CAP_BRANCHES, TTL_PROJECT_INFO, projectId);
+        return mapArray(all, BranchInfo::from);
     }
 
     /**
-     * 获取顶级项目组（用于树形选择第一层；懒加载）。
-     * 请求带 top_level_only=true 只返回顶层组；旧版 GitLab / 部分部署不支持该参数时会
-     * 把子组也一并返回，这里再按 parent_id 兜底过滤一次，保证第一层只含顶级组。
+     * 获取顶级项目组（用于树形选择第一层；懒加载），自动翻页至
+     * {@link #HARD_CAP_GROUPS}。请求带 top_level_only=true 只返回顶层组；
+     * 旧版 GitLab / 部分部署不支持该参数时会把子组也一并返回，这里再按
+     * parent_id 兜底过滤一次，保证第一层只含顶级组。
      */
-    public List<GroupEntry> listRootGroups(int perPage) throws Exception {
-        String url = apiQuery(GitLabEndpoints.GROUPS,
-                query(Map.of(
-                        GitLabEndpoints.PARAM_PER_PAGE, String.valueOf(perPage),
+    public List<GroupEntry> listRootGroups() throws Exception {
+        JsonArray all = pagedGet(GitLabEndpoints.GROUPS,
+                Map.of(
                         GitLabEndpoints.PARAM_ORDER_BY, GitLabEndpoints.ORDER_NAME,
                         GitLabEndpoints.PARAM_SORT, GitLabEndpoints.SORT_ASC,
-                        GitLabEndpoints.PARAM_TOP_LEVEL_ONLY, GitLabEndpoints.BOOL_TRUE)));
-        JsonElement elem = cachedGet(url, TTL_LIST_GROUP);
+                        GitLabEndpoints.PARAM_TOP_LEVEL_ONLY, GitLabEndpoints.BOOL_TRUE),
+                PAGE_SIZE, HARD_CAP_GROUPS, TTL_LIST_GROUP);
         List<GroupEntry> top = new ArrayList<>();
-        if (elem instanceof JsonArray arr) {
-            for (JsonElement el : arr) {
-                if (el != null && el.isJsonObject() && JsonUtil.isRootLevel(el.getAsJsonObject())) {
-                    top.add(GroupEntry.from(el.getAsJsonObject()));
-                }
+        for (JsonElement el : all) {
+            if (el != null && el.isJsonObject() && JsonUtil.isRootLevel(el.getAsJsonObject())) {
+                top.add(GroupEntry.from(el.getAsJsonObject()));
             }
         }
         return top;
     }
 
     /**
-     * 获取指定组的直接子组（GET /groups/:id/subgroups），用于树形选择按层懒加载
+     * 获取指定组的直接子组（GET /groups/:id/subgroups），自动翻页，用于树形选择按层懒加载
      */
-    public List<GroupEntry> listSubGroups(long groupId, int perPage) throws Exception {
-        String url = apiQuery(GitLabEndpoints.GROUP_SUBGROUPS,
-                query(Map.of(
-                        GitLabEndpoints.PARAM_PER_PAGE, String.valueOf(perPage),
+    public List<GroupEntry> listSubGroups(long groupId) throws Exception {
+        JsonArray all = pagedGet(GitLabEndpoints.GROUP_SUBGROUPS,
+                Map.of(
                         GitLabEndpoints.PARAM_ORDER_BY, GitLabEndpoints.ORDER_NAME,
-                        GitLabEndpoints.PARAM_SORT, GitLabEndpoints.SORT_ASC)),
-                groupId);
-        return mapArray(cachedGet(url, TTL_LIST_GROUP), GroupEntry::from);
+                        GitLabEndpoints.PARAM_SORT, GitLabEndpoints.SORT_ASC),
+                PAGE_SIZE, HARD_CAP_GROUPS, TTL_LIST_GROUP, groupId);
+        return mapArray(all, GroupEntry::from);
     }
 
     /**
-     * 获取指定组的直接项目（不含 include_subgroups，即不含子组项目），用于树形选择展开时懒加载
+     * 获取指定组的直接项目（不含 include_subgroups，即不含子组项目），自动翻页，
+     * 用于树形选择展开时懒加载
      */
-    public List<GitLabProject> listDirectProjects(long groupId, int perPage) throws Exception {
-        String url = apiQuery(GitLabEndpoints.GROUP_PROJECTS,
-                query(Map.of(
-                        GitLabEndpoints.PARAM_PER_PAGE, String.valueOf(perPage),
+    public List<GitLabProject> listDirectProjects(long groupId) throws Exception {
+        JsonArray all = pagedGet(GitLabEndpoints.GROUP_PROJECTS,
+                Map.of(
                         GitLabEndpoints.PARAM_ORDER_BY, GitLabEndpoints.ORDER_NAME,
-                        GitLabEndpoints.PARAM_SORT, GitLabEndpoints.SORT_ASC)),
-                groupId);
-        return mapArray(cachedGet(url, TTL_LIST_GROUP), GitLabProject::from);
+                        GitLabEndpoints.PARAM_SORT, GitLabEndpoints.SORT_ASC),
+                PAGE_SIZE, HARD_CAP_GROUPS, TTL_LIST_GROUP, groupId);
+        return mapArray(all, GitLabProject::from);
+    }
+
+    /**
+     * 通用分页拉取：逐页 GET 聚合为一个 {@link JsonArray}，适用于「需要全量列表」的
+     * 只读端点（Job / 分支 / 组树）。
+     * <ul>
+     *   <li>停止条件（满足任一）：本页元素数 &lt; perPage（末页）；已到达
+     *       X-Total-Pages 头给出的总页数；累计达到 {@code hardCap}；</li>
+     *   <li>X-Total-Pages 在部分部署上缺省时，仅靠「短页」判定，逻辑依然正确；</li>
+     *   <li>聚合结果整体按 {@code ttlMillis} 缓存（缓存 key 不含页码），
+     *       ttl &le; 0 不缓存。</li>
+     * </ul>
+     *
+     * @param template    端点模板（%s 占位）
+     * @param fixedParams 除分页外的固定查询参数（顺序稳定，可空）
+     * @param perPage     每页条数（GitLab 最大 100）
+     * @param hardCap     聚合元素硬上限，超过即截断
+     * @param ttlMillis   缓存 TTL
+     * @param args        端点模板参数
+     */
+    private JsonArray pagedGet(String template, Map<String, String> fixedParams,
+                               int perPage, int hardCap, long ttlMillis, Object... args)
+            throws Exception {
+        String baseUrl = api(template, args);
+        Map<String, String> baseParams = new LinkedHashMap<>();
+        if (fixedParams != null) {
+            baseParams.putAll(fixedParams);
+        }
+        baseParams.put(GitLabEndpoints.PARAM_PER_PAGE, String.valueOf(perPage));
+        String baseQuery = query(baseParams);
+
+        if (ttlMillis > 0) {
+            String key = cacheKey(baseUrl + baseQuery);
+            long now = System.currentTimeMillis();
+            synchronized (CACHE) {
+                CacheEntry entry = CACHE.get(key);
+                if (entry != null && entry.expiresAt > now && entry.value instanceof JsonArray cached) {
+                    return cached;
+                }
+            }
+        }
+
+        JsonArray all = new JsonArray();
+        int page = 1;
+        int totalPages = Integer.MAX_VALUE;
+        while (all.size() < hardCap) {
+            Map<String, String> pageParams = new LinkedHashMap<>(baseParams);
+            pageParams.put(GitLabEndpoints.PARAM_PAGE, String.valueOf(page));
+            HttpRequest request = get(baseUrl + query(pageParams)).GET().build();
+            HttpResponse<String> resp = send(request, HttpResponse.BodyHandlers.ofString());
+            int sc = resp.statusCode();
+            if (sc < 200 || sc >= 300) {
+                throw new GitLabApiException(sc, resp.body());
+            }
+            String body = resp.body();
+            JsonElement parsed = (body == null || body.isBlank())
+                    ? JsonNull.INSTANCE : JsonParser.parseString(body);
+            if (!(parsed instanceof JsonArray arr) || arr.isEmpty()) {
+                break; // 空页即末页
+            }
+            for (JsonElement e : arr) {
+                if (all.size() >= hardCap) {
+                    break;
+                }
+                all.add(e);
+            }
+            String totalHeader = resp.headers()
+                    .firstValue(GitLabEndpoints.HEADER_TOTAL_PAGES).orElse(null);
+            if (totalHeader != null) {
+                try {
+                    totalPages = Math.max(1, Integer.parseInt(totalHeader.trim()));
+                } catch (NumberFormatException ignore) {
+                    // 非数字头忽略，退化为短页判定
+                }
+            }
+            if (arr.size() < perPage || page >= totalPages) {
+                break;
+            }
+            page++;
+        }
+
+        if (ttlMillis > 0) {
+            String key = cacheKey(baseUrl + baseQuery);
+            long now = System.currentTimeMillis();
+            synchronized (CACHE) {
+                CACHE.put(key, new CacheEntry(all, now + ttlMillis));
+                purgeExpired(now);
+            }
+        }
+        return all;
     }
 
     /**
@@ -211,7 +383,7 @@ public class GitLabApiService {
      */
     public String getJobTrace(long projectId, long jobId) throws Exception {
         String url = api(GitLabEndpoints.JOB_TRACE, projectId, jobId);
-        HttpResponse<String> resp = client.send(get(url).GET().build(), HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = send(get(url).GET().build(), HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
             return resp.body();
         }
@@ -235,7 +407,7 @@ public class GitLabApiService {
         if (fromByte > 0) {
             builder.header(GitLabEndpoints.HEADER_RANGE, "bytes=" + fromByte + "-");
         }
-        HttpResponse<byte[]> resp = client.send(builder.GET().build(), HttpResponse.BodyHandlers.ofByteArray());
+        HttpResponse<byte[]> resp = send(builder.GET().build(), HttpResponse.BodyHandlers.ofByteArray());
         int code = resp.statusCode();
         if (code == 416) {
             // 请求偏移已到日志末尾：没有新内容可追加；carry 保留，若日志后续追加仍可无缝拼接
@@ -390,11 +562,14 @@ public class GitLabApiService {
                 .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8))
                 .build();
         try {
-            return PipelineInfo.from(executeJson(request).getAsJsonObject());
+            PipelineInfo created = PipelineInfo.from(executeJson(request).getAsJsonObject());
+            invalidateAccountCache();
+            return created;
         } catch (GitLabApiException ex) {
             // 把实际请求的 URL 一并带出，便于用户用浏览器/curl 直接复现，
             // 区分「端点/令牌问题」与「ref 无 CI 配置」。
-            throw new GitLabApiException(ex.statusCode, "POST " + url + "  body=" + form + "  -> " + ex.getMessage());
+            // 注意：不能把 form 拼进异常消息——variables 中可能包含密钥类变量。
+            throw new GitLabApiException(ex.statusCode, "POST " + url + "  -> " + ex.getMessage());
         }
     }
 
@@ -462,7 +637,7 @@ public class GitLabApiService {
      */
     private JsonElement postNoBody(String url) throws Exception {
         JsonElement result = executeJson(get(url).POST(HttpRequest.BodyPublishers.noBody()).build());
-        clearCache();
+        invalidateAccountCache();
         return result;
     }
 
@@ -485,47 +660,182 @@ public class GitLabApiService {
     }
 
     private JsonElement executeJson(HttpRequest request) throws Exception {
-        HttpResponse<String> resp = client.send(request, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() >= 200 && resp.statusCode() < 300) {
+        return parseJsonResponse(send(request, HttpResponse.BodyHandlers.ofString()));
+    }
+
+    /**
+     * 不做任何 GET 重试的 JSON 请求（连接测试等需要快速反馈的场景）。
+     */
+    private JsonElement executeJsonNoRetry(HttpRequest request) throws Exception {
+        return parseJsonResponse(send(request, HttpResponse.BodyHandlers.ofString(), true));
+    }
+
+    private JsonElement parseJsonResponse(HttpResponse<String> resp) throws GitLabApiException {
+        int sc = resp.statusCode();
+        if (sc >= 200 && sc < 300) {
             String body = resp.body();
             if (body == null || body.isBlank()) {
                 return JsonNull.INSTANCE;
             }
             return JsonParser.parseString(body);
         }
-        throw new GitLabApiException(resp.statusCode(), resp.body());
+        throw new GitLabApiException(sc, resp.body());
     }
 
     /**
-     * 带 TTL 的 GET 缓存读取；ttlMillis <= 0 表示不缓存直接请求（缓存本身是 static 共享的）
+     * 统一发送入口：仅对幂等 GET 在「429 / 502 / 503 / 504 / 瞬时网络异常」时做最多
+     * {@link #MAX_ATTEMPTS} 次尝试。429 优先读 Retry-After（秒），其余按指数退避
+     * 500ms、1s；POST 等写操作绝不自动重试（避免重复触发/重复取消）。
+     */
+    private <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler)
+            throws Exception {
+        return send(request, handler, false);
+    }
+
+    /**
+     * 统一发送入口：仅对幂等 GET 在「429 / 502 / 503 / 504 / 瞬时网络异常」时做最多
+     * {@link #MAX_ATTEMPTS} 次尝试。429 优先读 Retry-After（秒），其余按指数退避
+     * 500ms、1s；POST 等写操作绝不自动重试（避免重复触发/重复取消）。
+     * TLS/证书失败立即抛出并给出证书引导（重试只会重复弹出证书确认框）。
+     *
+     * @param disableRetry true 时即使 GET 也只尝试一次（连接测试）
+     */
+    private <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler,
+                                    boolean disableRetry) throws Exception {
+        boolean retriable = !disableRetry && "GET".equals(request.method());
+        IOException lastIo = null;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            try {
+                HttpResponse<T> resp = client.send(request, handler);
+                int code = resp.statusCode();
+                if (retriable && attempt + 1 < MAX_ATTEMPTS && isRetriableStatus(code)) {
+                    long waitMs = retryWaitMillis(resp, code, attempt);
+                    if (waitMs >= 0) {
+                        Thread.sleep(waitMs);
+                        continue;
+                    }
+                }
+                return resp;
+            } catch (IOException io) {
+                if (isSslFailure(io)) {
+                    throw GitLabApiException.sslFailure(io);
+                }
+                lastIo = io;
+                if (!retriable || attempt + 1 >= MAX_ATTEMPTS) {
+                    throw new GitLabApiException(0, io.getMessage(), io);
+                }
+                Thread.sleep(backoffMillis(attempt));
+            }
+        }
+        // 理论不可达：循环内必定 return 或 throw
+        throw new GitLabApiException(0, lastIo == null ? "请求失败" : lastIo.getMessage(), lastIo);
+    }
+
+    /**
+     * 判断异常链中是否存在 TLS/证书层失败（不受信 CA、握手失败、证书过期/吊销等）。
+     */
+    private static boolean isSslFailure(Throwable t) {
+        Throwable cur = t;
+        int guard = 0;
+        while (cur != null && guard++ < 10) {
+            if (cur instanceof SSLException || cur instanceof CertificateException) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isRetriableStatus(int code) {
+        return code == 429 || code == 502 || code == 503 || code == 504;
+    }
+
+    /**
+     * 计算重试等待毫秒数；429 优先使用 Retry-After（delta-seconds，HTTP-date 形式不支持
+     * 时退化为指数退避），其余状态按 500ms 起步翻倍。返回 -1 表示不应重试。
+     */
+    private static long retryWaitMillis(HttpResponse<?> resp, int code, int attempt) {
+        if (code == 429) {
+            String header = resp.headers().firstValue(GitLabEndpoints.HEADER_RETRY_AFTER).orElse(null);
+            if (header != null) {
+                try {
+                    long secs = Long.parseLong(header.trim());
+                    return Math.min(RETRY_AFTER_CAP_MS, Math.max(0, secs) * 1000L);
+                } catch (NumberFormatException ignore) {
+                    // Retry-After 可能是 HTTP-date，这里不解析绝对时间，走指数退避
+                }
+            }
+        }
+        return backoffMillis(attempt);
+    }
+
+    private static long backoffMillis(int attempt) {
+        return 500L * (1L << Math.max(0, attempt));
+    }
+
+    /**
+     * 带 TTL 的 GET 缓存读取；ttlMillis <= 0 表示不缓存直接请求。
+     * 缓存 key 带账号 id 前缀，多账号/多实例共享 static 缓存也不会串数据。
      */
     private JsonElement cachedGet(String url, long ttlMillis) throws Exception {
         if (ttlMillis <= 0) {
             return executeJson(get(url).GET().build());
         }
+        String key = cacheKey(url);
         long now = System.currentTimeMillis();
-        CacheEntry entry = CACHE.get(url);
-        if (entry != null && entry.expiresAt > now) {
-            return entry.value;
+        synchronized (CACHE) {
+            CacheEntry entry = CACHE.get(key);
+            if (entry != null && entry.expiresAt > now) {
+                return entry.value;
+            }
         }
         JsonElement value = executeJson(get(url).GET().build());
-        CACHE.put(url, new CacheEntry(value, now + ttlMillis));
-        purgeExpired(now);
+        synchronized (CACHE) {
+            CACHE.put(key, new CacheEntry(value, now + ttlMillis));
+            purgeExpired(now);
+        }
         return value;
     }
 
+    private String cacheKey(String url) {
+        return accountId + "|" + url;
+    }
+
     /**
-     * 清理已过期的缓存项，防止长期运行后缓存无限增长
+     * 清理已过期的缓存项（调用方需持有 CACHE 的监视器）
      */
     private static void purgeExpired(long now) {
         CACHE.entrySet().removeIf(e -> e.getValue().expiresAt <= now);
     }
 
     /**
-     * 触发/取消/重试/执行等写操作后调用：清空缓存，让下次刷新立即拿到最新数据
+     * 清空当前账号的 GET 缓存：触发/取消/重试/执行等写操作成功后调用，
+     * 让下次刷新立即拿到最新数据，且不影响其他账号的缓存。
+     */
+    public void invalidateAccountCache() {
+        clearAccountCache(accountId);
+    }
+
+    /**
+     * 清空指定账号的 GET 缓存（供 service 层在无实例时调用）。
+     */
+    public static void clearAccountCache(String accountId) {
+        if (accountId == null || accountId.isEmpty()) {
+            return;
+        }
+        String prefix = accountId + "|";
+        synchronized (CACHE) {
+            CACHE.keySet().removeIf(k -> k.startsWith(prefix));
+        }
+    }
+
+    /**
+     * 清空全部账号的 GET 缓存（仅用于全局设置级变更/排障）。
      */
     public static void clearCache() {
-        CACHE.clear();
+        synchronized (CACHE) {
+            CACHE.clear();
+        }
     }
 
     private static String encode(String s) {

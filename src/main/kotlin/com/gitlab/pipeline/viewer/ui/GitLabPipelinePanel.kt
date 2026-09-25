@@ -1,5 +1,6 @@
 package com.gitlab.pipeline.viewer.ui
 
+import com.gitlab.pipeline.viewer.model.Account
 import com.gitlab.pipeline.viewer.model.JobInfo
 import com.gitlab.pipeline.viewer.model.PipelineInfo
 import com.gitlab.pipeline.viewer.model.PipelineStatus
@@ -10,6 +11,7 @@ import com.gitlab.pipeline.viewer.services.JobTraceResult
 import com.gitlab.pipeline.viewer.services.NotificationService
 import com.gitlab.pipeline.viewer.services.PipelineDataService
 import com.gitlab.pipeline.viewer.settings.GitLabSettings
+import com.gitlab.pipeline.viewer.util.GitUrlUtil
 import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
@@ -21,6 +23,7 @@ import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowAnchor
@@ -81,7 +84,12 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     private val autoRefreshTimer: Timer
     private val layoutTimer: Timer
     private var preferredAnchor: ToolWindowAnchor? = null
-    private var detectTimer: Timer? = null
+
+    /**
+     * 启动期项目自动检测的后台任务句柄：在 IDE pooled 线程上间隔重试，
+     * 替代旧实现的 EDT Swing Timer（旧实现每 2 秒在 EDT 上扫描全部 Git 仓库）。
+     */
+    private var detectionFuture: java.util.concurrent.Future<*>? = null
 
     @Volatile
     private var currentProject: ProjectEntry? = null
@@ -138,6 +146,10 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     private val settingsAction = SettingsAction()
 
     // ============================================================ 控件
+    private val accountCombo: ComboBox<Account> =
+        ComboBox(DefaultComboBoxModel<Account>())
+    private var syncingAccountCombo = false
+
     private val projectSelector: ProjectTreeSelector = ProjectTreeSelector(ideaProject)
 
     // 必须传 ideaProject：JobSelector 内部的 ChooseByNamePopup 需要非空 project 计算 searchScope
@@ -167,7 +179,9 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         buildUi()
         setMinimumSize(Dimension(JBUI.scale(340), JBUI.scale(280)))
         val initial = refreshCurrentProjects()
-        if (initial != null && GitLabSettings.getInstance().token.isNotEmpty()) {
+        if (initial != null
+            && GitLabSettings.getInstance().gitlabUrl.isNotEmpty()
+            && GitLabSettings.getInstance().token.isNotEmpty()) {
             onProjectSelected(initial)
         }
         startProjectDetection()
@@ -227,6 +241,27 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         topTb.setTargetComponent(this)
         topToolbar = topTb
         val topPanel = wrapToolbar(topTb.component)
+        // 账号切换器：轻量下拉，切换后整个项目树/流水线/日志按新账号重置
+        accountCombo.renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: JList<*>?, value: Any?, index: Int, selected: Boolean, hasFocus: Boolean,
+            ): Component {
+                val c = super.getListCellRendererComponent(list, value, index, selected, hasFocus)
+                text = (value as? Account)?.name() ?: ""
+                return c
+            }
+        }
+        accountCombo.toolTipText = "切换 GitLab 账号"
+        accountCombo.preferredSize = Dimension(JBUI.scale(150), JBUI.scale(26))
+        accountCombo.addActionListener {
+            if (syncingAccountCombo) return@addActionListener
+            val a = accountCombo.selectedItem as? Account ?: return@addActionListener
+            if (a.id != GitLabSettings.getInstance().activeAccountId) {
+                switchAccount(a.id)
+            }
+        }
+        topPanel.add(JBLabel("账号:"))
+        topPanel.add(accountCombo)
         topPanel.add(JBLabel("项目:"))
         projectSelector.preferredSize = Dimension(JBUI.scale(300), JBUI.scale(26))
         topPanel.add(projectSelector)
@@ -339,6 +374,7 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
 
         updateActionButtons()
         updatePageControls()
+        rebuildAccountCombo()
     }
 
     /**
@@ -405,9 +441,86 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     // ============================================================ 项目
 
     private fun refreshCurrentProjects(): ProjectEntry? {
-        currentWindowProjects = GitRepositoryUtil.collectProjects()
-        projectSelector.setCurrentWindowProjects(currentWindowProjects)
-        return projectSelector.selectedProject
+        val projects = GitRepositoryUtil.collectProjects()
+        currentWindowProjects = projects
+        projectSelector.setCurrentWindowProjects(projects)
+        // 多账号：只自动选中属于「当前账号 host」的检测项目，优先恢复上次选择
+        val sameHost = projects.filter { entryMatchesActiveAccount(it) }
+        val last = GitLabSettings.getInstance().lastProjectPath
+        val pick = sameHost.firstOrNull { it.path == last } ?: sameHost.firstOrNull()
+        projectSelector.selectProjectQuiet(pick)
+        return pick
+    }
+
+    /**
+     * 判断检测到的本地项目是否归属当前账号（host+端口比较）；
+     * 当前账号地址为空（未配置）时不做限制，沿用 v1.0 行为。
+     */
+    private fun entryMatchesActiveAccount(entry: ProjectEntry): Boolean {
+        val activeHost = GitUrlUtil.extractHostWithPort(GitLabSettings.getInstance().gitlabUrl)
+        if (activeHost.isEmpty()) return true
+        val entryHost = GitUrlUtil.extractHostWithPort(entry.remoteUrl)
+        return entryHost.equals(activeHost, ignoreCase = true)
+    }
+
+    /**
+     * 重建顶部账号下拉（设置变更后调用）；静默选中当前账号，不触发切换。
+     */
+    private fun rebuildAccountCombo() {
+        syncingAccountCombo = true
+        try {
+            val model = accountCombo.model as DefaultComboBoxModel<Account>
+            model.removeAllElements()
+            val accounts = GitLabSettings.getInstance().accounts
+            for (a in accounts) {
+                model.addElement(a)
+            }
+            val activeId = GitLabSettings.getInstance().activeAccountId
+            accountCombo.selectedItem = accounts.firstOrNull { it.id == activeId }
+        } finally {
+            syncingAccountCombo = false
+        }
+    }
+
+    /**
+     * 切换当前账号：失效旧上下文（generation +1 丢弃在途回调），重置项目树、
+     * 流水线表格、Job 与日志，然后按新账号重新检测项目；无匹配项目时给出引导。
+     */
+    private fun switchAccount(id: String) {
+        val s = GitLabSettings.getInstance()
+        if (!s.setActiveAccount(id)) return
+        rebuildAccountCombo()
+        generation.incrementAndGet()
+        currentProject = null
+        currentProjectId = -1
+        selectedPipelineId = -1
+        selectedJobId = -1
+        lastPipelines = emptyList()
+        currentWindowProjects = emptyList()
+        pipelinePage = 1
+        pipelineHasNext = false
+        traceJobId = -1
+        traceOffset = 0
+        traceCarry = ByteArray(0)
+        refreshInFlight.set(false)
+        pipelineModel.rowCount = 0
+        pipelinePageLabel.text = "第 1 页"
+        jobSelector.setJobs(emptyList())
+        logViewer.setLog("")
+        projectSelector.clearSelection()
+        projectSelector.reload()
+        updateActionButtons()
+        updatePageControls()
+
+        val entry = refreshCurrentProjects()
+        when {
+            s.gitlabUrl.isBlank() ->
+                setStatus("当前账号未配置 GitLab 地址，请点击【设置】补全账号信息。")
+            s.token.isEmpty() ->
+                setStatus("当前账号未配置访问令牌，请点击【设置】填写令牌（需勾选 api 权限）。")
+            entry != null -> onProjectSelected(entry)
+            else -> setStatus("当前窗口未检测到该账号的 Git 项目，可从项目下拉的项目组树中选择。")
+        }
     }
 
     private fun refreshProjectsManually() {
@@ -417,11 +530,31 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     }
 
     private fun onProjectSelected(entry: ProjectEntry) {
-        if (disposed || entry == null) return
+        if (disposed) return
+        val s = GitLabSettings.getInstance()
+        // 从组树/当前项目列表选中了归属其他账号 host 的项目：先切账号再加载，
+        // 保证 API 请求使用正确的地址与令牌（项目组树只可能来自当前账号，此路径主要
+        // 服务于多 host 的当前窗口项目）。
+        val entryHost = GitUrlUtil.extractHostWithPort(entry.remoteUrl)
+        if (entryHost.isNotEmpty()) {
+            val owner = s.accounts.firstOrNull {
+                GitUrlUtil.extractHostWithPort(it.url()).equals(entryHost, ignoreCase = true)
+            }
+            if (owner != null && owner.id() != s.activeAccountId) {
+                switchAccount(owner.id())
+                // switchAccount 内部会对检测到的同账号项目再触发 onProjectSelected；
+                // 但用户显式选择的目标可能不在「当前窗口项目」列表，故继续显式加载。
+            }
+        }
+        if (disposed) return
         currentProject = entry
-        GitLabSettings.getInstance().lastProjectPath = entry.path
-        if (GitLabSettings.getInstance().token.isEmpty()) {
-            setStatus("未配置访问令牌，请点击【设置】填写 GitLab 访问令牌（需勾选 api 权限）。")
+        s.lastProjectPath = entry.path
+        if (s.gitlabUrl.isBlank()) {
+            setStatus("当前账号未配置 GitLab 地址，请点击【设置】补全账号信息。")
+            return
+        }
+        if (s.token.isEmpty()) {
+            setStatus("当前账号未配置访问令牌，请点击【设置】填写 GitLab 访问令牌（需勾选 api 权限）。")
             return
         }
         refreshAll(entry, 1)
@@ -438,7 +571,11 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         val targetPage = maxOf(1, page)
         val keepPipelineId = selectedPipelineId
         val keepJobId = selectedJobId
-        logViewer.showLoading("正在加载 ${entry.path} 的流水线…")
+        // 仅首屏/切项目（列表为空）时用全屏遮罩；同项目手动刷新、写操作后刷新、翻页
+        // 已有内容可看，遮罩只会反复遮挡日志（刷新期间列表/按钮自身有 loading 态）
+        if (lastPipelines.isEmpty()) {
+            logViewer.showLoading("正在加载 ${entry.path} 的流水线…")
+        }
         ProgressManager.getInstance().run(object : Task.Backgroundable(ideaProject, "加载 ${entry.path}", true) {
             override fun run(@NotNull indicator: ProgressIndicator) {
                 try {
@@ -823,10 +960,20 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         val dlg = SettingsDialog(ideaProject)
         if (dlg.showAndGet()) {
             restartAutoRefreshTimer()
-            val cur = currentProject
-            refreshCurrentProjects()
-            if (cur != null && GitLabSettings.getInstance().token.isNotEmpty()) {
-                refreshAll(cur)
+            // 设置可能增删账号、改令牌或切换当前账号：统一走切换流程，
+            // 使项目树、流水线、Job、日志按最新配置整体重置。
+            val activeId = GitLabSettings.getInstance().activeAccountId
+            if (activeId.isNotEmpty()) {
+                switchAccount(activeId)
+            } else {
+                rebuildAccountCombo()
+                generation.incrementAndGet()
+                currentProject = null
+                pipelineModel.rowCount = 0
+                jobSelector.setJobs(emptyList())
+                logViewer.setLog("")
+                projectSelector.clearSelection()
+                setStatus("尚未配置任何 GitLab 账号，请点击【设置】添加账号与访问令牌。")
             }
         }
     }
@@ -923,29 +1070,43 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
     // ============================================================ 项目自动检测
 
     private fun startProjectDetection() {
-        val attempts = intArrayOf(0)
-        var timer: Timer? = null
-        val listener = java.awt.event.ActionListener {
-            // 通过外层可空变量持有引用（Timer lambda 内不能引用正在声明的 val）
-            val t = timer ?: return@ActionListener
-            if (disposed) {
-                t.stop(); return@ActionListener
-            }
-            if (currentProject != null) {
-                t.stop(); return@ActionListener
-            }
-            val entry = refreshCurrentProjects()
-            if (entry != null && GitLabSettings.getInstance().token.isNotEmpty()) {
-                t.stop()
-                onProjectSelected(entry)
-            } else if (++attempts[0] >= 15) {
-                t.stop()
+        // 后台线程：IDE 启动后 Git 仓库信息可能尚未就绪，按 2s 间隔最多重试 15 次（约 30s）。
+        // Git 仓库扫描在 ReadAction 内完成（见 GitRepositoryUtil），UI 更新只在 invokeLater 里做；
+        // 命中、面板释放或线程被中断时立即结束，不再占用 EDT。
+        detectionFuture = ApplicationManager.getApplication().executeOnPooledThread {
+            var attempt = 0
+            try {
+                while (!disposed && attempt < 15) {
+                    Thread.sleep(2000)
+                    if (disposed || currentProject != null) return@executeOnPooledThread
+                    attempt++
+                    val projects = try {
+                        GitRepositoryUtil.collectProjects()
+                    } catch (t: Throwable) {
+                        log.warn("项目自动检测：读取 Git 仓库失败", t)
+                        continue
+                    }
+                    ApplicationManager.getApplication().invokeLater {
+                        if (disposed || currentProject != null) return@invokeLater
+                        currentWindowProjects = projects
+                        projectSelector.setCurrentWindowProjects(projects)
+                        // 多账号：只自动命中归属当前账号 host 的本地项目，优先上次选择
+                        val sameHost = projects.filter { entryMatchesActiveAccount(it) }
+                        val last = GitLabSettings.getInstance().lastProjectPath
+                        val entry = sameHost.firstOrNull { it.path == last } ?: sameHost.firstOrNull()
+                        projectSelector.selectProjectQuiet(entry)
+                        if (entry != null && GitLabSettings.getInstance().gitlabUrl.isNotEmpty()
+                            && GitLabSettings.getInstance().token.isNotEmpty()) {
+                            // 已命中：中断后台 sleep，检测线程立即结束
+                            detectionFuture?.cancel(true)
+                            onProjectSelected(entry)
+                        }
+                    }
+                }
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
             }
         }
-        val t = Timer(2000, listener)
-        timer = t
-        detectTimer = t
-        t.start()
     }
 
     // ============================================================ 工具方法
@@ -1237,10 +1398,8 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
 
     private inner class RefreshListAction :
         GitLabAction("刷新列表", "重新加载当前项目的流水线", AllIcons.Actions.Refresh) {
-        override fun computeEnabled(): Boolean {
-            val cur = currentProject ?: return false
-            return GitLabSettings.getInstance().token.isNotEmpty()
-        }
+        override fun computeEnabled(): Boolean =
+            currentProject != null && GitLabSettings.getInstance().token.isNotEmpty()
 
         override fun doPerform() {
             val cur = currentProject
@@ -1273,10 +1432,8 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
 
     private inner class TriggerPipelineAction :
         GitLabAction("新建流水线", "新建一条流水线", AllIcons.General.Add) {
-        override fun computeEnabled(): Boolean {
-            val cur = currentProject ?: return false
-            return GitLabSettings.getInstance().token.isNotEmpty()
-        }
+        override fun computeEnabled(): Boolean =
+            currentProject != null && GitLabSettings.getInstance().token.isNotEmpty()
 
         override fun doPerform() = triggerPipeline()
     }
@@ -1346,7 +1503,7 @@ class GitLabPipelinePanel(private val ideaProject: Project, private val toolWind
         generation.incrementAndGet()
         autoRefreshTimer.stop()
         layoutTimer.stop()
-        detectTimer?.stop()
+        detectionFuture?.cancel(true)
         logViewer.dispose()
     }
 

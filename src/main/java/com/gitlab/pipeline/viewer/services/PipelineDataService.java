@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 
 /**
  * 数据获取与缓存编排（project 级 service）。
@@ -27,6 +28,20 @@ import java.util.concurrent.Executors;
 @Service
 public final class PipelineDataService {
 
+    /**
+     * 流水线详情并发补全的共享执行器（daemon 线程，JVM 退出不阻塞）。
+     * 旧实现每次翻页/刷新都 newFixedThreadPool 再 shutdown，高频自动刷新下反复创建
+     * 线程；进程内共享一个固定 6 线程池即可，{@link #fillDetails} 只做短暂 HTTP 调用。
+     */
+    private static final ExecutorService DETAIL_POOL = Executors.newFixedThreadPool(6, new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "gitlab-pipeline-detail");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+
     public PipelineDataService() {
     }
 
@@ -39,7 +54,7 @@ public final class PipelineDataService {
      */
     private GitLabApiService api() {
         GitLabSettings s = GitLabSettings.getInstance();
-        return new GitLabApiService(s.getGitlabUrl(), s.getToken(), s.getRequestTimeoutSeconds());
+        return new GitLabApiService(s.getActiveAccountId(), s.getGitlabUrl(), s.getToken(), s.getRequestTimeoutSeconds());
     }
 
     /**
@@ -177,10 +192,10 @@ public final class PipelineDataService {
     }
 
     /**
-     * 清空底层 API 缓存（项目/列表刷新用）
+     * 清空当前账号的底层 API 缓存（项目/列表刷新用），不影响其他账号
      */
     public void clearCache() {
-        GitLabApiService.clearCache();
+        GitLabApiService.clearAccountCache(GitLabSettings.getInstance().getActiveAccountId());
     }
 
     // ---------------------------------------------------------------- 数据流内的领域选择逻辑
@@ -192,22 +207,17 @@ public final class PipelineDataService {
         if (pipelines == null || pipelines.isEmpty()) {
             return;
         }
-        ExecutorService pool = Executors.newFixedThreadPool(Math.min(6, pipelines.size()));
-        try {
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            for (PipelineInfo p : pipelines) {
-                futures.add(CompletableFuture.runAsync(() -> {
-                    try {
-                        p.fillDetail(api.getPipelineDetail(projectId, p.id));
-                    } catch (Exception ignored) {
-                        // 详情拉取失败不影响列表展示，耗时/触发人保持默认
-                    }
-                }, pool));
-            }
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        } finally {
-            pool.shutdown();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (PipelineInfo p : pipelines) {
+            futures.add(CompletableFuture.runAsync(() -> {
+                try {
+                    p.fillDetail(api.getPipelineDetail(projectId, p.id));
+                } catch (Exception ignored) {
+                    // 详情拉取失败不影响列表展示，耗时/触发人保持默认；详情请求内部已有重试
+                }
+            }, DETAIL_POOL));
         }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
     }
 
     /**
